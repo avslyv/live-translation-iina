@@ -1,0 +1,5 @@
+# Import-only dependencies for the legacy overlay's model-free unit tests.
+# MLX, PyTorch, PyObjC, model weights and running Ollama are not needed in CI.
+numpy==2.4.6
+sounddevice==0.5.5
+soundfile==0.14.0

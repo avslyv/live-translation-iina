@@ -1,0 +1,46 @@
+name: Bug report
+description: Report an installation, subtitle, translation, or playback problem.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Check the README troubleshooting section first. Remove private media paths,
+        transcript content, tokens and other personal information from logs.
+        For a security issue, follow SECURITY.md instead.
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Mode
+      options:
+        - IINA native subtitles
+        - System audio overlay
+        - Setup or installation
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: macOS, Mac chip and RAM, Python, IINA, Ollama, and model versions.
+      placeholder: "macOS …, M… / … GB, Python …, IINA …, Ollama …"
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Include seek timestamps or a small public sample when relevant.
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected and actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs or screenshots
+      description: Include only the smallest useful excerpt. Redact private information.

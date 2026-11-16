@@ -6,6 +6,7 @@ __pycache__/
 
 # Virtual environment
 .venv/
+.venv*/
 venv/
 
 # Runtime / logs (generated at run time)
@@ -41,3 +42,32 @@ coverage.xml
 
 # Local tooling
 .serena/
+
+# Local credentials and machine-specific configuration
+.env
+.env.*
+!.env.example
+iina-token
+
+# Generated subtitle caches, local media and release artifacts
+/subtitles/
+/recognition/
+/backups/
+/dist/
+/build/
+*.srt
+*.vtt
+*.mp4
+*.mkv
+*.avi
+*.mov
+*.webm
+*.vob
+*.ac3
+performance-benchmark.json
+seek-buffer-verification.json
+
+# Local Python tooling
+.ruff_cache/
+.mypy_cache/
+.pyright/

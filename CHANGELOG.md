@@ -1,6 +1,30 @@
 # Changelog
 
-## Unreleased
+## 1.2.0 — 2026-11-16
+
+### Native IINA subtitles
+
+- Added a local IINA plugin and authenticated loopback worker for English-to-Russian
+  translation of local videos. Output is a regular SRT track rendered by IINA.
+- Automatically attach the Russian track when a video opens, and reload it as
+  translated sections become available.
+- Prioritize the playhead after a seek. Unprepared sections wait on an owned pause
+  and resume after subtitles load; manual pauses and track choices are preserved.
+- Ignore stale responses after rapid seeks or file changes. Release an owned wait
+  on errors, timeout, or an explicit user resume.
+
+### Cache and local inference
+
+- Cache complete translated sections by video content and generation profile,
+  including timestamps, source text, model identity, and fixed generation settings.
+- Retain independent recognition results so a missing translation does not require
+  running Whisper again. Recover missing SRT output from authoritative JSON caches.
+- Prepare the whole file in the background, with phased batches when a useful
+  playback buffer is ready. Whisper and the translator use memory in sequence.
+- Added portable installation, model-free Python and plugin tests, and contributor
+  documentation. Existing system-audio overlay functionality remains available.
+
+## Upstream changes included after 1.1.0
 
 - **All Whisper languages in the menus**: the From/To pickers now list every language Whisper can transcribe (Japanese, Korean, Arabic, Hindi, …) instead of nine.
 - **Setup preflight**: `setup.sh` checks for Apple silicon, macOS 14+ and Python 3.12+ up front and explains what is missing, instead of failing inside pip.
@@ -27,4 +51,4 @@ Faster, smoother transcription and translation — and cleaner text at chunk bou
 ### Housekeeping
 - The app's boot log is trimmed to the last 2000 lines on each launch, so it can no longer grow without bound.
 
-Full commit history: https://github.com/KazKozDev/live-translation/commits/main
+Upstream history: [KazKozDev/live-translation](https://github.com/KazKozDev/live-translation/commits/main).

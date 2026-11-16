@@ -1,0 +1,7 @@
+# Native IINA mode: no audio loopback driver, PyObjC overlay, or sounddevice.
+# Translation runs in the separately installed Ollama server.
+mlx==0.32.4
+mlx-metal==0.32.4
+mlx-whisper==0.4.3
+numpy==2.5.5
+huggingface_hub==2.4.0

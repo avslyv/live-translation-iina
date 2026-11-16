@@ -1,7 +1,7 @@
 [project]
 name = "live-translation"
-version = "1.1.0"
-description = "Local macOS live speech transcription and translation overlay."
+version = "1.2.0"
+description = "Local translation for native IINA subtitles and macOS system audio."
 readme = "README.md"
 requires-python = ">=3.12"
 license = { file = "LICENSE" }
@@ -25,7 +25,7 @@ ignore = [
 
 [tool.pyright]
 pythonVersion = "3.12"
-include = ["live_translation", "live_translate_overlay.py", "tests"]
+include = ["live_translation", "live_translate_overlay.py", "iina_bridge.py", "tools", "tests"]
 reportAttributeAccessIssue = false
 reportMissingImports = false
 reportMissingModuleSource = false
