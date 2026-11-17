@@ -33,7 +33,7 @@ scipy==1.18.1
 setuptools==84.2.1
 sympy==1.14.0
 tiktoken==0.14.0
-torch==2.15.0
+torch==2.13.0
 tqdm==4.70.1
 truststore==0.10.5
 typing_extensions==4.16.0
