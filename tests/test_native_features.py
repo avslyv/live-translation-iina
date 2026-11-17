@@ -1,6 +1,7 @@
 """Exercise the actual native pipeline with deterministic model doubles."""
 
 import copy
+import io
 import threading
 import time
 from unittest import mock
@@ -15,6 +16,9 @@ from live_translation.translation_quality import stable_cue_id
 class NativeBridge(Bridge):
     def _probe(self, path):
         return 75.0
+
+    def _decoder_version(self):
+        return "fixture-ffmpeg"
 
     def _decode_audio(self, path, start, seconds):
         assert self.active is not None
@@ -48,6 +52,12 @@ def native(tmp_path, monkeypatch):
         lambda *_: {"whisper_revision": "fixture-whisper", "translation_digest": "fixture-digest"},
     )
     monkeypatch.setattr("iina_bridge.ollama_version", lambda: "fixture-ollama")
+    # All decoding is replaced by NativeBridge. Discovery and provenance must
+    # use the same double rather than silently relying on Homebrew on the host.
+    monkeypatch.setattr("iina_bridge.resolve_executable", lambda name: f"/fixture/{name}")
+    monkeypatch.setattr(
+        features, "local_urlopen", lambda *_args, **_kwargs: io.BytesIO(b'{"models":[]}')
+    )
 
     def translate(self, cues, *, on_cue=None, **kwargs):
         result = {}
@@ -124,6 +134,25 @@ def test_text_path_does_not_resolve_whisper_artifacts(native, monkeypatch):
         mock.Mock(side_effect=AssertionError("No Whisper dependency")),
     )
     assert activate(native)["source"]["kind"] == "text"
+
+
+def test_native_fixture_runs_without_host_tools_or_network(native, monkeypatch):
+    bridge, _, _, _ = native
+    monkeypatch.setenv("PATH", "")
+    monkeypatch.delenv("LT_FFMPEG", raising=False)
+    with (
+        mock.patch("iina_bridge.shutil.which", side_effect=AssertionError("No host discovery")),
+        mock.patch(
+            "live_translation.iina_features.subprocess.check_output",
+            side_effect=AssertionError("No host decoder process"),
+        ),
+        mock.patch("socket.create_connection", side_effect=AssertionError("No network")),
+    ):
+        state = activate(native)
+        assert state["source"]["kind"] == "text"
+        finish(bridge)
+        assert bridge._feature_response()["done"]
+        assert bridge.describe()["models"] == []
 
 
 def test_selected_audio_and_change_invalidate_old_translation(native):

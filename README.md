@@ -67,7 +67,7 @@ Requires an **Apple silicon Mac**, **macOS 14+**, and an internet connection for
 
 Open the disk image, then open **Live Translation Installer.app**. A [ZIP download](https://github.com/avslyv/live-translation-iina/releases/latest/download/Live-Translation-Installer-arm64.zip) is available too.
 
-This community build is ad-hoc signed and is not notarized by Apple. If macOS blocks the first launch, review the release and follow [Apple's instructions for opening an app you trust](https://support.apple.com/en-us/102445). That may require **System Settings → Privacy & Security → Open Anyway**. No Terminal command is required.
+The v1.4.0 installer is signed with the project's persistent local certificate and is not notarized by Apple. If macOS blocks the first launch, review the release and follow [Apple's instructions for opening an app you trust](https://support.apple.com/en-us/102445). That may require **System Settings → Privacy & Security → Open Anyway**. No Terminal command is required. The release includes a signing verification report and SHA-256 checksums.
 
 ### 2. Click Install Everything
 
@@ -238,7 +238,7 @@ Before attaching logs to an issue, remove tokens, private file paths, and transc
 - Initial preparation and uncached seeks take time. A powerful Mac helps, but a new section cannot show a translation before it has been processed.
 - Speech recognition and LLM translation can make mistakes, especially with music, accents, jargon, and mixed languages.
 - IINA's plugin system is enabled by the installer; future IINA API changes may require updates.
-- The graphical installer is currently ad-hoc signed rather than Apple-notarized. It downloads prerequisites and the large Whisper/Gemma weights during setup. The small pinned Silero VAD model is bundled with its MIT license.
+- The v1.4.0 installer uses a persistent local certificate, without Apple notarization. It downloads prerequisites and the large Whisper/Gemma weights during setup. The small pinned Silero VAD model is bundled with its MIT license.
 
 ## Project structure
 

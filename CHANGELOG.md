@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.4.0 — release candidate
+## 1.4.0 — 2026-11-17
 
 - Reuse a private local signing certificate for installer/DMG and the installed
   IINA launcher, preserving their identity across local rebuilds without changing
@@ -25,8 +25,9 @@
 - Ship a pinned MIT-licensed Silero VAD model for experimental whole-window speech
   gating. Retained audio is never cropped or concatenated; filtering is off by default.
 - Add a standalone token-free IINA package, artifact verification report and
-  Developer ID/notarization CI support. Actual Apple signing and fresh-OS acceptance
-  remain separate release gates; see [release signing](docs/RELEASE_SIGNING.md).
+  optional Developer ID/notarization CI support. This release uses the persistent
+  local certificate; Apple notarization and fresh-OS testing were not performed.
+  See [release signing](docs/RELEASE_SIGNING.md).
 
 Validation and measured results are tracked in [the benchmark guide](docs/BENCHMARK_1_4.md).
 
