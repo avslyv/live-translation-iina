@@ -25,6 +25,7 @@ from functools import lru_cache
 from importlib import metadata
 from pathlib import Path
 
+from live_translation.local_http import local_urlopen
 from live_translation.text_pipeline import live_translation_messages, strip_llm_noise
 from live_translation.translators import OllamaTranslator
 
@@ -34,7 +35,7 @@ PROFILE_VERSION = 1
 
 @lru_cache(maxsize=16)
 def _local_file_sha256(path, size, modified_ns, changed_ns):
-    """Hash custom local weights once per file version, never once per chunk."""
+    """Hash local/Xet weights once per file version, never once per chunk."""
     digest = hashlib.sha256()
     with Path(path).open("rb") as stream:
         for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
@@ -47,10 +48,15 @@ def _local_weight_identity(path, *, cached_hf_blob=False):
     stat = resolved.stat()
     if not resolved.is_file() or stat.st_size < 1:
         raise ValueError("Пустой или некорректный файл модели Whisper")
-    # HF LFS blobs are content-addressed by the SHA-256 already verified by the
-    # downloader. Resolving the symlink is cheap, and follows a model update to
-    # its new digest without rereading 1.6 GB before every playback chunk.
-    if cached_hf_blob and re.fullmatch(r"[a-f0-9]{64}", resolved.name):
+    # Legacy flat HF LFS blobs use their verified SHA-256 as the filename.
+    # New Hub caches instead shard Xet objects as blobs/ab/<xet-hash>; their
+    # 64-hex identifier is NOT the SHA-256 of the reconstructed weight bytes.
+    # Keep the legacy shortcut while stat-memoizing a real hash for Xet files.
+    if (
+        cached_hf_blob
+        and resolved.parent.name == "blobs"
+        and re.fullmatch(r"[a-f0-9]{64}", resolved.name)
+    ):
         digest = resolved.name
     else:
         digest = _local_file_sha256(str(resolved), stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
@@ -305,7 +311,7 @@ class DeterministicTranslator(OllamaTranslator):
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=120) as response:
+            with local_urlopen(request, timeout=120) as response:
                 body = json.loads(response.read().decode("utf-8"))
         except (urllib.error.URLError, UnicodeError, json.JSONDecodeError) as error:
             raise RuntimeError(

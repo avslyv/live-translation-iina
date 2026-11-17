@@ -137,14 +137,19 @@ def download_artifact(artifact: dict[str, Any], cache_dir: Path, emit: Emitter =
 
 def find_executable(name: str) -> Path | None:
     search = os.pathsep.join((os.environ.get("PATH", ""), "/opt/homebrew/bin", "/usr/local/bin"))
-    value = shutil.which(name, path=search)
+    try:
+        value = shutil.which(name, path=search)
+    except OSError:
+        # A protected host location is unavailable to this installation, just
+        # like a missing prerequisite. Provision our own verified copy instead.
+        return None
     return Path(value) if value else None
 
 
 def _working_binary(path: Path, option: str, marker: str) -> bool:
-    if not path.is_file() or not os.access(path, os.X_OK):
-        return False
     try:
+        if not path.is_file() or not os.access(path, os.X_OK):
+            return False
         result = subprocess.run(
             [str(path), option], capture_output=True, text=True, check=False, timeout=15
         )

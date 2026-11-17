@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.3.1 — 2026-11-17
+
+### First-install reliability
+
+- Back up partially prepared runtime folders without requiring an existing worker.
+  A first installation can now reuse its newly created virtual environment while
+  copying the worker and plugin from the installer payload.
+- Treat inaccessible existing applications and executables as unavailable, then
+  install verified private copies. This fixes prerequisite discovery when host
+  software cannot be read.
+- Add a restricted fallback for official Ollama model transfers on affected DNS
+  routes. It validates HTTPS destinations before each redirect, resumes bounded
+  parallel ranges, checks every artifact's size and SHA-256, and commits the model
+  manifest only after all artifacts are verified.
+- Connect Python clients directly to validated loopback services instead of
+  routing them through a system HTTP proxy. Local redirects must stay on the same
+  origin; external HTTPS verification remains enabled.
+- Remove a duplicate truststore injection from Whisper download setup and correct
+  content identity for reconstructed weights in newer Hugging Face Xet caches.
+- Make runtime homes, cache locations, service labels and loopback ports explicit
+  for isolated validation. Normal installation defaults remain unchanged.
+- Track cold-install methodology, current status and evidence separately from the
+  earlier upgrade test in [the cold-install report](docs/COLD_INSTALL_TEST.md).
+
 ## 1.3.0 — 2026-11-17
 
 ### Downloadable macOS installer

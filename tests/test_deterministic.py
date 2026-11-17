@@ -2,8 +2,11 @@ import copy
 import hashlib
 import json
 import sys
+import threading
 import types
 import urllib.error
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
 
 import pytest
@@ -55,7 +58,7 @@ def test_identical_input_has_identical_wire_request_and_fixed_sampling(monkeypat
         requests.append((request.full_url, request.data, timeout))
         return Response({"message": {"content": "фа-диез минор"}, "done_reason": "stop"})
 
-    monkeypatch.setattr("urllib.request.urlopen", urlopen)
+    monkeypatch.setattr("live_translation.deterministic.local_urlopen", urlopen)
     engine = translator(temperature=0.95, reasoning=True)
     history = [("This riff is in E minor.", "Этот рифф в ми миноре.")]
     before = copy.deepcopy(history)
@@ -83,7 +86,7 @@ def test_no_hidden_conversation_state_leaks_between_calls(monkeypatch):
         requests.append(request.data)
         return Response({"message": {"content": "перевод"}})
 
-    monkeypatch.setattr("urllib.request.urlopen", urlopen)
+    monkeypatch.setattr("live_translation.deterministic.local_urlopen", urlopen)
     engine = translator()
     engine.translate("Middle", history=[])
     engine.translate("Unrelated beginning", history=[("old", "старое")])
@@ -95,7 +98,7 @@ def test_no_hidden_conversation_state_leaks_between_calls(monkeypatch):
 
 def test_callback_gets_only_the_complete_committable_translation(monkeypatch):
     monkeypatch.setattr(
-        "urllib.request.urlopen",
+        "live_translation.deterministic.local_urlopen",
         lambda *_args, **_kwargs: Response({"message": {"content": "<think>hidden</think>Привет"}}),
     )
     values = []
@@ -115,7 +118,9 @@ def test_callback_gets_only_the_complete_committable_translation(monkeypatch):
     ],
 )
 def test_unusable_or_truncated_responses_are_not_cached_as_translation(monkeypatch, body):
-    monkeypatch.setattr("urllib.request.urlopen", lambda *_args, **_kwargs: Response(body))
+    monkeypatch.setattr(
+        "live_translation.deterministic.local_urlopen", lambda *_args, **_kwargs: Response(body)
+    )
     with pytest.raises(RuntimeError):
         translator().translate("hello")
 
@@ -124,9 +129,47 @@ def test_http_error_becomes_runtime_error(monkeypatch):
     def fail(*_args, **_kwargs):
         raise urllib.error.URLError("connection refused")
 
-    monkeypatch.setattr("urllib.request.urlopen", fail)
+    monkeypatch.setattr("live_translation.deterministic.local_urlopen", fail)
     with pytest.raises(RuntimeError, match="Ollama"):
         translator().translate("hello")
+
+
+def test_translation_uses_direct_loopback_even_when_the_system_requires_a_proxy(monkeypatch):
+    received = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, format, *args):
+            pass
+
+        def do_POST(self):
+            received.append(
+                (self.path, json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+            )
+            body = json.dumps({"message": {"content": "Прямой локальный перевод"}}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    # An ephemeral fixture server is deliberately unrelated to installed Ollama.
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    try:
+        monkeypatch.setattr(urllib.request, "getproxies", lambda: {"http": "http://127.0.0.1:1"})
+        monkeypatch.setattr(urllib.request, "proxy_bypass", lambda host: False)
+        monkeypatch.setattr(urllib.request, "_opener", None)
+        engine = translator(url=f"http://127.0.0.1:{server.server_port}")
+        assert engine.translate("Speech") == "Прямой локальный перевод"
+        assert received[0][0] == "/api/chat"
+        assert received[0][1]["model"] == "gemma4:12b"
+        # The client must not replace or populate urllib's global opener.
+        assert urllib.request._opener is None
+    finally:
+        server.shutdown()
+        server.server_close()
+        worker.join(timeout=5)
 
 
 def test_profile_hash_captures_model_artifacts_options_and_prompt_but_not_dict_order():
@@ -225,7 +268,7 @@ def test_local_model_identities_are_stable_offline_and_cover_manifest_and_hf_sna
 ):
     hf, repository, snapshot, ollama, manifest = model_fixture(tmp_path)
     monkeypatch.setattr(
-        "urllib.request.urlopen",
+        "live_translation.deterministic.local_urlopen",
         lambda *_args, **_kwargs: pytest.fail("Artifact identity must not access the network"),
     )
     identity = local_model_identities(
@@ -269,6 +312,48 @@ def test_hf_model_update_follows_pinned_ref_without_rereading_large_blob(tmp_pat
         "mlx-community/whisper-test", "gemma4:12b", hf_cache=hf, ollama_root=ollama
     )
     assert previous["whisper_revision"]["revision"] != changed["whisper_revision"]["revision"]
+
+
+def test_sharded_hf_xet_identifier_is_not_mislabeled_as_weight_sha256(tmp_path):
+    hf, _repository, snapshot, ollama, _manifest = model_fixture(tmp_path)
+    # Actual Hub 2.4 layout: Xet identity differs from the reconstructed LFS SHA.
+    xet_hash = "786820e8958abcfd7a2084c0d273f629ab8d7cbee560178f49a9cecb715b8041"
+    reconstructed = b"reconstructed Whisper weight bytes"
+    blob = hf / "blobs" / xet_hash[:2] / xet_hash
+    blob.parent.mkdir(parents=True)
+    blob.write_bytes(reconstructed)
+    weights = snapshot / "weights.safetensors"
+    weights.unlink()
+    weights.symlink_to(blob)
+
+    identity = local_model_identities(
+        "mlx-community/whisper-test", "gemma4:12b", hf_cache=hf, ollama_root=ollama
+    )
+    weight_identity = identity["whisper_revision"]["weights"]
+    assert weight_identity["sha256"] == hashlib.sha256(reconstructed).hexdigest()
+    assert weight_identity["sha256"] != xet_hash
+    assert weight_identity["size"] == len(reconstructed)
+
+
+def test_sharded_hf_weights_are_hashed_once_until_their_stat_changes(tmp_path):
+    from live_translation.deterministic import _local_file_sha256, _local_weight_identity
+
+    blob = tmp_path / "blobs" / "ab" / ("ab" * 32)
+    blob.parent.mkdir(parents=True)
+    blob.write_bytes(b"original reconstructed bytes")
+    before = _local_file_sha256.cache_info()
+    first = _local_weight_identity(blob, cached_hf_blob=True)
+    after_first = _local_file_sha256.cache_info()
+    assert after_first.misses == before.misses + 1
+    assert _local_weight_identity(blob, cached_hf_blob=True) == first
+    assert _local_file_sha256.cache_info().hits == after_first.hits + 1
+
+    changed = b"updated reconstructed bytes with a different size"
+    blob.write_bytes(changed)
+    updated = _local_weight_identity(blob, cached_hf_blob=True)
+    assert updated["sha256"] == hashlib.sha256(changed).hexdigest()
+    assert updated["sha256"] != first["sha256"]
+    assert _local_file_sha256.cache_info().misses == after_first.misses + 1
 
 
 def test_custom_local_model_identity_survives_move_but_detects_weight_changes(tmp_path):

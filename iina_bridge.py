@@ -37,16 +37,19 @@ from live_translation.deterministic import (
     seed_asr,
     whisper_decode_options,
 )
+from live_translation.local_http import local_urlopen
 from live_translation.media_cache import (
     fingerprint_file,
     key_for,
     source_signature,
     validate_chunks,
 )
+from live_translation.runtime_config import load_runtime_config
 from live_translation.sessions import export_subtitles
 from live_translation.text_pipeline import strip_hallucinations
 
-SUPPORT = Path.home() / "Library/Application Support/LiveTranslate"
+RUNTIME = load_runtime_config()
+SUPPORT = RUNTIME.home / "Library/Application Support/LiveTranslate"
 CHUNK_SECONDS = 30.0
 CONTEXT_SECONDS = 1.0
 CACHE_VERSION = 4
@@ -57,7 +60,7 @@ MODEL_IDLE_SECONDS = 10.0
 MLX_CACHE_BYTES = 128 * 1024 * 1024
 ASR_BATCH_SIZE = 4
 ASR_BATCH_BUFFER_SECONDS = 60.0
-PORT = 18743
+PORT = RUNTIME.bridge_port
 MAX_BODY_BYTES = 16_384
 WHISPER_MODEL = "mlx-community/whisper-large-v3-turbo"
 TRANSLATION_MODEL = "gemma4:12b"
@@ -75,7 +78,9 @@ def resolve_executable(name):
 def ollama_version():
     """Fingerprint the running local engine, including CLI/Homebrew installs."""
     try:
-        with urllib.request.urlopen("http://127.0.0.1:11434/api/version", timeout=5) as response:
+        with local_urlopen(
+            load_runtime_config().ollama_url + "/api/version", timeout=5
+        ) as response:
             body = json.loads(response.read())
         version = body.get("version") if isinstance(body, dict) else None
         if not isinstance(version, str) or not version.strip():
@@ -241,7 +246,12 @@ class Media:
 
 class Bridge:
     def __init__(self, cache_dir=None, *, start_worker=True, profile=None):
-        self.cache_dir = Path(cache_dir) if cache_dir else SUPPORT / "subtitles"
+        self.runtime = load_runtime_config()
+        self.cache_dir = (
+            Path(cache_dir)
+            if cache_dir
+            else self.runtime.home / "Library/Application Support/LiveTranslate/subtitles"
+        )
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.whisper_model = os.environ.get("LT_WHISPER_MODEL", WHISPER_MODEL)
         self.translation_model = os.environ.get("LT_TRANSLATION_MODEL", TRANSLATION_MODEL)
@@ -682,7 +692,7 @@ class Bridge:
                 model=self.translation_model,
                 target="ru",
                 source="en",
-                url="http://127.0.0.1:11434",
+                url=self.runtime.ollama_url,
                 max_tokens=256,
                 temperature=0.0,
                 reasoning=False,
@@ -927,13 +937,13 @@ class Bridge:
             }
         ).encode("utf-8")
         request = urllib.request.Request(
-            "http://127.0.0.1:11434/api/generate",
+            self.runtime.ollama_url + "/api/generate",
             data=payload,
             headers={"Content-Type": "application/json"},
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=20) as response:
+            with local_urlopen(request, timeout=20) as response:
                 body = json.loads(response.read().decode("utf-8"))
             if body.get("done_reason") not in (None, "unload"):
                 raise RuntimeError("Ollama did not confirm model unload")

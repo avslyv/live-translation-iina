@@ -4,16 +4,17 @@
 from __future__ import annotations
 
 import argparse
-import contextlib
 import fcntl
 import json
 import os
 import platform
 import plistlib
+import re
 import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -22,21 +23,38 @@ from pathlib import Path
 SOURCE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SOURCE))
 from installer.dependencies import ensure_ffmpeg, ensure_iina, ensure_ollama  # noqa: E402
+from live_translation.local_http import local_urlopen  # noqa: E402
+from live_translation.model_download import download_ollama_model  # noqa: E402
+from live_translation.runtime_config import load_runtime_config  # noqa: E402
 from tools.install_iina import start_agent  # noqa: E402
 
 WHISPER = "mlx-community/whisper-large-v3-turbo"
 TRANSLATOR = "gemma4:12b"
-OLLAMA_URL = "http://127.0.0.1:11434"
-BRIDGE_LABEL = "local.live-translation.iina"
-OLLAMA_LABEL = "local.live-translation.ollama"
+RUNTIME = load_runtime_config()
+OLLAMA_URL = RUNTIME.ollama_url
+BRIDGE_LABEL = RUNTIME.bridge_label
+OLLAMA_LABEL = RUNTIME.ollama_label
+
+
+class InstallationCancelled(Exception):
+    """An explicit stop request, distinct from retryable download failures."""
+
+
+class ModelTransferUnavailable(RuntimeError):
+    """The native model client cannot use the current network route."""
 
 
 class Reporter:
     def __init__(self, log_path: Path | None = None):
         self.log_path = log_path
         self.progress = 0.0
+        self.lock = threading.RLock()
 
     def __call__(self, event: dict):
+        with self.lock:
+            self._write(event)
+
+    def _write(self, event: dict):
         if "progress" in event:
             self.progress = max(self.progress, min(1.0, float(event["progress"])))
             event = {**event, "progress": self.progress}
@@ -93,7 +111,7 @@ def run(args: list[str], report: Reporter, *, env: dict | None = None):
 
 
 def local_json(route: str):
-    with urllib.request.urlopen(OLLAMA_URL + route, timeout=5) as response:
+    with local_urlopen(load_runtime_config().ollama_url + route, timeout=5) as response:
         return json.load(response)
 
 
@@ -142,6 +160,7 @@ def runtime_ready(python: Path) -> bool:
 
 
 def ensure_ollama_server(binary: Path, support: Path, report: Reporter):
+    runtime = load_runtime_config()
     try:
         body = local_json("/api/version")
     except (OSError, ValueError):
@@ -149,14 +168,14 @@ def ensure_ollama_server(binary: Path, support: Path, report: Reporter):
     if isinstance(body, dict) and body.get("version"):
         report({"type": "log", "message": "Using the running local Ollama server."})
         return
-    agent = Path.home() / "Library/LaunchAgents" / (OLLAMA_LABEL + ".plist")
+    agent = runtime.home / "Library/LaunchAgents" / (runtime.ollama_label + ".plist")
     agent.parent.mkdir(parents=True, exist_ok=True)
     config = {
-        "Label": OLLAMA_LABEL,
-        "ProgramArguments": [str(binary), "serve"],
+        "Label": runtime.ollama_label,
+        "ProgramArguments": runtime.wrap_arguments([str(binary), "serve"]),
         "EnvironmentVariables": {
-            "OLLAMA_HOST": "127.0.0.1:11434",
-            "OLLAMA_MODELS": str(Path.home() / ".ollama/models"),
+            **runtime.environment(),
+            "OLLAMA_HOST": f"127.0.0.1:{runtime.ollama_port}",
         },
         "RunAtLoad": True,
         "KeepAlive": True,
@@ -174,7 +193,7 @@ def ensure_ollama_server(binary: Path, support: Path, report: Reporter):
     temporary.write_bytes(plistlib.dumps(config))
     temporary.chmod(0o600)
     temporary.replace(agent)
-    start_agent(agent, OLLAMA_LABEL)
+    start_agent(agent, runtime.ollama_label)
     for _ in range(60):
         try:
             body = local_json("/api/version")
@@ -183,7 +202,46 @@ def ensure_ollama_server(binary: Path, support: Path, report: Reporter):
         except (OSError, ValueError):
             pass
         time.sleep(1)
-    raise RuntimeError("Ollama could not start on port 11434. Review the Ollama log and retry.")
+    raise RuntimeError(
+        f"Ollama could not start on port {runtime.ollama_port}. Review the Ollama log and retry."
+    )
+
+
+def native_model_pull(report: Reporter):
+    request = urllib.request.Request(
+        load_runtime_config().ollama_url + "/api/pull",
+        data=json.dumps({"name": TRANSLATOR, "stream": True}).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with local_urlopen(request, timeout=180) as response:
+        for line in response:
+            item = json.loads(line)
+            if item.get("error"):
+                reason = str(item["error"])
+                if any(
+                    marker in reason.lower()
+                    for marker in (
+                        "redirect target not allowed",
+                        "max retries exceeded",
+                        "certificate",
+                        "tls handshake",
+                        "dial tcp",
+                        "connection reset",
+                        "unexpected eof",
+                    )
+                ):
+                    raise ModelTransferUnavailable("The native model download route is unavailable")
+                safe_reason = re.sub(r"https?://\S+", "[download URL]", reason)
+                raise RuntimeError("Ollama download failed: " + safe_reason)
+            total, completed = item.get("total", 0), item.get("completed", 0)
+            progress = 0.5 + 0.2 * min(1, completed / total) if total else 0.5
+            detail = str(item.get("status", "Downloading Gemma"))
+            if total:
+                detail += f" · {completed / 1e9:.2f} / {total / 1e9:.2f} GB"
+            report.stage(
+                "translation-model", "Downloading Gemma translation model", progress, detail
+            )
 
 
 def pull_translation_model(report: Reporter):
@@ -193,36 +251,27 @@ def pull_translation_model(report: Reporter):
             {"type": "log", "message": "The translation model is already installed; reusing it."}
         )
         return
-    request = urllib.request.Request(
-        OLLAMA_URL + "/api/pull",
-        data=json.dumps({"name": TRANSLATOR, "stream": True}).encode(),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(request, timeout=180) as response:
-        for line in response:
-            item = json.loads(line)
-            if item.get("error"):
-                raise RuntimeError("Ollama download failed: " + str(item["error"]))
-            total, completed = item.get("total", 0), item.get("completed", 0)
-            progress = 0.5 + 0.2 * min(1, completed / total) if total else 0.5
-            detail = str(item.get("status", "Downloading Gemma"))
-            if total:
-                detail += f" · {completed / 1e9:.2f} / {total / 1e9:.2f} GB"
-            report.stage(
-                "translation-model", "Downloading Gemma translation model", progress, detail
-            )
+    try:
+        native_model_pull(report)
+    except InstallationCancelled:
+        raise
+    except (ModelTransferUnavailable, OSError, ValueError):
+        report(
+            {
+                "type": "log",
+                "message": "The native transfer could not complete. Downloading verified model artifacts from the official registry.",
+            }
+        )
+        download_ollama_model(TRANSLATOR, load_runtime_config().ollama_models, report)
     tags = local_json("/api/tags")
     if not any(model.get("name") == TRANSLATOR for model in tags.get("models", [])):
         raise RuntimeError("The translation model download did not complete. Retry to resume it.")
 
 
 def download_whisper(report: Reporter):
-    # Use macOS trust roots without disabling HTTPS verification.
-    with contextlib.suppress(ImportError):
-        from pip._vendor import truststore
-
-        truststore.inject_into_ssl()
+    # The pinned Hub/httpcore2 transport already uses macOS trust roots.
+    # Globally injecting pip's separate vendored truststore would wrap the
+    # installed copy twice and recurse in SSLContext's verification setters.
     from huggingface_hub import snapshot_download
     from tqdm.auto import tqdm
 
@@ -260,8 +309,9 @@ def install(report: Reporter):
         raise RuntimeError("An Apple silicon Mac running macOS 14 or newer is required.")
     if int(platform.mac_ver()[0].split(".")[0]) < 14:
         raise RuntimeError("macOS 14 or newer is required.")
-    support = Path.home() / "Library/Application Support/LiveTranslate"
-    cache = Path.home() / "Library/Caches/LiveTranslationInstaller"
+    runtime = load_runtime_config()
+    support = runtime.home / "Library/Application Support/LiveTranslate"
+    cache = runtime.home / "Library/Caches/LiveTranslationInstaller"
     support.mkdir(parents=True, exist_ok=True)
     support.chmod(0o700)
     cache.mkdir(parents=True, exist_ok=True)
@@ -273,9 +323,7 @@ def install(report: Reporter):
         raise RuntimeError("Another Live Translation installation is already running.") from error
     with lock:
         report.stage("preflight", "Checking your Mac", 0.05)
-        minimum = (
-            3 if whisper_ready() and (Path.home() / ".ollama/models/manifests").exists() else 16
-        )
+        minimum = 3 if whisper_ready() and (runtime.ollama_models / "manifests").exists() else 16
         if shutil.disk_usage(support).free < minimum * 1024**3:
             raise RuntimeError(f"Free at least {minimum} GB of disk space, then retry.")
         iina = ensure_iina(cache, emit=report)
@@ -290,7 +338,7 @@ def install(report: Reporter):
         os.environ["LT_FFMPEG"] = str(ffmpeg)
         project = support / "project"
         python = project / ".venv/bin/python"
-        agent = Path.home() / "Library/LaunchAgents" / (BRIDGE_LABEL + ".plist")
+        agent = runtime.home / "Library/LaunchAgents" / (runtime.bridge_label + ".plist")
         previous_agent = agent.exists()
         stopped = False
         backup_venv = None
@@ -306,7 +354,7 @@ def install(report: Reporter):
                 )
                 if previous_agent:
                     subprocess.run(
-                        ["/bin/launchctl", "bootout", f"gui/{os.getuid()}/{BRIDGE_LABEL}"],
+                        ["/bin/launchctl", "bootout", f"gui/{os.getuid()}/{runtime.bridge_label}"],
                         check=False,
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
@@ -386,9 +434,7 @@ def install(report: Reporter):
             report.stage("verification", "Checking translation service", 0.97)
             for _ in range(30):
                 try:
-                    with urllib.request.urlopen(
-                        "http://127.0.0.1:18743/health", timeout=3
-                    ) as response:
+                    with local_urlopen(runtime.bridge_url + "/health", timeout=3) as response:
                         if json.load(response).get("status") == "ok":
                             break
                 except (OSError, ValueError):
@@ -401,7 +447,7 @@ def install(report: Reporter):
         except BaseException:
             if integration_attempted or stopped:
                 subprocess.run(
-                    ["/bin/launchctl", "bootout", f"gui/{os.getuid()}/{BRIDGE_LABEL}"],
+                    ["/bin/launchctl", "bootout", f"gui/{os.getuid()}/{runtime.bridge_label}"],
                     check=False,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
@@ -412,7 +458,7 @@ def install(report: Reporter):
                 backup_venv.rename(project / ".venv")
             if (stopped or integration_attempted) and previous_agent:
                 try:
-                    start_agent(agent)
+                    start_agent(agent, runtime.bridge_label)
                 except (OSError, RuntimeError, subprocess.SubprocessError) as restore_error:
                     report(
                         {
@@ -449,7 +495,7 @@ def main() -> int:
     report = Reporter(Path.home() / "Library/Logs/LiveTranslationInstaller/installer.log")
 
     def cancelled(_signum, _frame):
-        raise RuntimeError("Installation cancelled. Downloads are retained for a retry.")
+        raise InstallationCancelled("Installation cancelled. Downloads are retained for a retry.")
 
     signal.signal(signal.SIGTERM, cancelled)
     try:
@@ -458,6 +504,9 @@ def main() -> int:
         else:
             install(report)
         return 0
+    except InstallationCancelled as error:
+        report({"type": "log", "message": str(error)})
+        return 130
     except Exception as error:
         report({"type": "error", "message": str(error)})
         return 1

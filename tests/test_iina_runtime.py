@@ -62,7 +62,7 @@ def test_ffmpeg_duration_fallback_rejects_unusable_media(monkeypatch, tmp_path, 
 
 def test_ollama_fingerprints_the_running_server_not_an_app_bundle():
     with mock.patch(
-        "iina_bridge.urllib.request.urlopen", return_value=io.BytesIO(b'{"version":"1.2.3"}')
+        "iina_bridge.local_urlopen", return_value=io.BytesIO(b'{"version":"1.2.3"}')
     ) as request:
         assert ollama_version() == "1.2.3"
     request.assert_called_once_with("http://127.0.0.1:11434/api/version", timeout=5)
@@ -71,7 +71,7 @@ def test_ollama_fingerprints_the_running_server_not_an_app_bundle():
 @pytest.mark.parametrize("response", [b"{}", b"[]", b"not-json", b'{"version":null}'])
 def test_invalid_ollama_version_is_actionable(response):
     with (
-        mock.patch("iina_bridge.urllib.request.urlopen", return_value=io.BytesIO(response)),
+        mock.patch("iina_bridge.local_urlopen", return_value=io.BytesIO(response)),
         pytest.raises(RuntimeError, match="Start Ollama"),
     ):
         ollama_version()

@@ -24,6 +24,9 @@ import time
 from pathlib import Path
 
 SOURCE = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(SOURCE))
+from live_translation.runtime_config import load_runtime_config  # noqa: E402
+
 LABEL = "local.live-translation.iina"
 DEFAULT_WHISPER_MODEL = "mlx-community/whisper-large-v3-turbo"
 DEFAULT_TRANSLATION_MODEL = "gemma4:12b"
@@ -80,7 +83,11 @@ def render_plugin(source: str, token: str) -> str:
     permission for native subtitle commands; older versions do not.
     Fail if the template changes, rather than publishing a broken installation.
     """
+    config = load_runtime_config()
     replacements = {
+        'const SERVICE_URL = "http://127.0.0.1:18743/state";': "const SERVICE_URL = "
+        + json.dumps(config.bridge_url + "/state")
+        + ";",
         "const { console, core, event, file, http, menu, mpv, preferences }": "const { console, core, event, http, menu, mpv, preferences }",
         'let token = "";': "let token = " + json.dumps(token) + ";",
         " || !file.exists(path)": "",
@@ -99,11 +106,12 @@ def render_plugin(source: str, token: str) -> str:
     return source
 
 
-def copy_runtime(source: Path, destination: Path) -> None:
-    """Copy only runtime source, never .git, virtualenvs, models or user data."""
+def copy_runtime(source: Path, destination: Path, *, require_worker: bool = True) -> None:
+    """Copy runtime source, allowing an incomplete prior install only for backups."""
     if source.resolve() == destination.resolve():
         return
-    files = [source / "iina_bridge.py"]
+    worker = source / "iina_bridge.py"
+    files = [worker] if require_worker or worker.exists() else []
     for name in ("requirements-iina.txt", "requirements-iina.lock.txt"):
         if (source / name).exists():
             files.append(source / name)
@@ -120,11 +128,15 @@ def launch_agent(
     whisper_model: str,
     translation_model: str,
 ) -> dict:
+    config = load_runtime_config()
     service = {
-        "Label": LABEL,
-        "ProgramArguments": [str(project / ".venv/bin/python"), str(project / "iina_bridge.py")],
+        "Label": config.bridge_label,
+        "ProgramArguments": config.wrap_arguments(
+            [str(project / ".venv/bin/python"), str(project / "iina_bridge.py")]
+        ),
         "WorkingDirectory": str(project),
         "EnvironmentVariables": {
+            **config.environment(),
             "PATH": SEARCH_PATH,
             "PYTHONUNBUFFERED": "1",
             "HF_HUB_OFFLINE": "1",
@@ -146,11 +158,12 @@ def launch_agent(
 
 
 def start_agent(
-    agent: Path, label: str = LABEL, *, attempts: int = 21, retry_delay: float = 0.5
+    agent: Path, label: str | None = None, *, attempts: int = 21, retry_delay: float = 0.5
 ) -> None:
     """Replace a per-user job, allowing launchd time to finish its prior bootout."""
     if attempts < 1 or retry_delay < 0:
         raise ValueError("LaunchAgent retry settings must be positive")
+    label = label or load_runtime_config().bridge_label
     domain = f"gui/{os.getuid()}"
     target = domain + "/" + label
     subprocess.run(
@@ -180,6 +193,7 @@ def start_agent(
 
 
 def install_launcher(app: Path, iina: Path, agent: Path, plugin_info: dict, backup: Path) -> None:
+    config = load_runtime_config()
     if app.exists():
         shutil.copytree(app, backup / app.name, symlinks=True)
     contents = app / "Contents"
@@ -187,8 +201,12 @@ def install_launcher(app: Path, iina: Path, agent: Path, plugin_info: dict, back
     resources.mkdir(parents=True, exist_ok=True)
     launcher = (
         "#!/bin/bash\nset -e\n"
-        f'launchctl bootstrap "gui/$(id -u)" {shlex.quote(str(agent))} >/dev/null 2>&1 || true\n'
-        f'launchctl kickstart "gui/$(id -u)/{LABEL}" >/dev/null 2>&1 || true\n'
+        + "".join(
+            "export " + name + "=" + shlex.quote(value) + "\n"
+            for name, value in config.environment().items()
+        )
+        + f'launchctl bootstrap "gui/$(id -u)" {shlex.quote(str(agent))} >/dev/null 2>&1 || true\n'
+        f'launchctl kickstart "gui/$(id -u)/{config.bridge_label}" >/dev/null 2>&1 || true\n'
         f"exec /usr/bin/open -a {shlex.quote(str(iina))}\n"
     )
     atomic_write(contents / "MacOS/LiveTranslationIINA", launcher.encode(), 0o755)
@@ -268,14 +286,16 @@ def parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
-    support = Path.home() / "Library/Application Support/LiveTranslate"
+    config = load_runtime_config()
+    support = config.home / "Library/Application Support/LiveTranslate"
     project = support / "project"
     installed_plugin = support / "iina-plugin"
     plugin_link = (
-        Path.home()
+        config.home
         / "Library/Application Support/com.colliderli.iina/plugins/iina-plugin.iinaplugin-dev"
     )
-    agent = Path.home() / "Library/LaunchAgents" / (LABEL + ".plist")
+    agent = config.home / "Library/LaunchAgents" / (config.bridge_label + ".plist")
+    preferences = config.cf_home / "Library/Preferences/com.colliderli.iina.plist"
     app = args.applications_dir.expanduser() / "Live Translation for IINA.app"
     iina = args.iina.expanduser().resolve()
     info = json.loads((SOURCE / "iina-plugin/Info.json").read_text())
@@ -345,14 +365,14 @@ def main(argv: list[str] | None = None) -> int:
         stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
         backup = support / "backups" / stamp
         backup.mkdir(parents=True, mode=0o700)
-        for previous in (agent, Path.home() / "Library/Preferences/com.colliderli.iina.plist"):
+        for previous in (agent, preferences):
             if previous.exists():
                 shutil.copy2(previous, backup / previous.name)
         if installed_plugin.exists():
             shutil.copytree(installed_plugin, backup / "iina-plugin", symlinks=True)
         if project.exists() and SOURCE.resolve() != project.resolve():
             old_runtime = backup / "runtime"
-            copy_runtime(project, old_runtime)
+            copy_runtime(project, old_runtime, require_worker=False)
         copy_runtime(SOURCE, project)
         if args.install_dependencies:
             if not python.exists():
@@ -366,7 +386,7 @@ def main(argv: list[str] | None = None) -> int:
                 ollama,
                 "pull",
                 args.translation_model,
-                env={**os.environ, "OLLAMA_HOST": "http://127.0.0.1:11434"},
+                env={**os.environ, **config.environment(), "OLLAMA_HOST": config.ollama_url},
             )
             download = (
                 "import pathlib,sys; from huggingface_hub import snapshot_download; "
@@ -378,7 +398,12 @@ def main(argv: list[str] | None = None) -> int:
                 "-c",
                 download,
                 args.whisper_model,
-                env={**os.environ, "HF_HUB_OFFLINE": "0", "TRANSFORMERS_OFFLINE": "0"},
+                env={
+                    **os.environ,
+                    **config.environment(),
+                    "HF_HUB_OFFLINE": "0",
+                    "TRANSFORMERS_OFFLINE": "0",
+                },
             )
         atomic_write(token_file, (token + "\n").encode())
         installed_plugin.mkdir(parents=True, exist_ok=True)
@@ -400,10 +425,11 @@ def main(argv: list[str] | None = None) -> int:
             project, support, ffmpeg, ffprobe, args.whisper_model, args.translation_model
         )
         atomic_write(agent, plistlib.dumps(service))
+        preferences.parent.mkdir(parents=True, exist_ok=True)
         run(
             "/usr/bin/defaults",
             "write",
-            "com.colliderli.iina",
+            str(preferences.with_suffix("")),
             "iinaEnablePluginSystem",
             "-bool",
             "true",
@@ -411,7 +437,7 @@ def main(argv: list[str] | None = None) -> int:
         run(
             "/usr/bin/defaults",
             "write",
-            "com.colliderli.iina",
+            str(preferences.with_suffix("")),
             "PluginEnabled." + info["identifier"],
             "-bool",
             "true",

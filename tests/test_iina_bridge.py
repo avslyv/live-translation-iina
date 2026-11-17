@@ -592,7 +592,7 @@ class BridgeTests(unittest.TestCase):
         bridge._translation_resident = True
         response = mock.MagicMock()
         response.__enter__.return_value.read.return_value = b'{"done_reason": "unload"}'
-        with mock.patch("iina_bridge.urllib.request.urlopen", return_value=response) as open_url:
+        with mock.patch("iina_bridge.local_urlopen", return_value=response) as open_url:
             bridge._release_translation()
             bridge._release_translation()
         open_url.assert_called_once()

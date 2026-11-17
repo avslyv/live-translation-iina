@@ -66,13 +66,13 @@ Open the disk image, then open **Live Translation Installer.app**. A [ZIP downlo
 
 This community build is ad-hoc signed and is not notarized by Apple. If macOS blocks the first launch, review the release and follow [Apple's instructions for opening an app you trust](https://support.apple.com/en-us/102445). That may require **System Settings → Privacy & Security → Open Anyway**. No Terminal command is required.
 
-### 2. Click Install
+### 2. Click Install Everything
 
 The native installer shows each step and its progress. It installs or reuses the prerequisites, adds the IINA plugin and local service, and downloads Whisper and Gemma model weights. Existing model downloads, subtitle caches, and settings are retained; replaced integration settings are backed up.
 
 Keep the disk image mounted until installation finishes. Model downloads are several gigabytes, so the first setup can take a while. When complete, use **Open IINA** and follow the restart reminder.
 
-The installer uses your user account's application and support folders. It does not require Homebrew or administrator access. See the [installer guide](docs/INSTALLER.md) for details, retry behavior, and developer builds.
+The installer uses your user account's application and support folders. It does not require Homebrew or administrator access. See the [installer guide](docs/INSTALLER.md) for details, retry behavior, and developer builds. The [cold-install report](docs/COLD_INSTALL_TEST.md) records the current validation status, evidence, and test limits separately from upgrade checks.
 
 ### 3. Open a video
 
@@ -147,6 +147,8 @@ New computation is not guaranteed to be bit-identical across different GPUs, eng
 
 The bridge listens on `127.0.0.1:18743` and requires a generated local bearer token for file control and status. The installed plugin uses loopback-network and OSD permissions. IINA 1.5+ also requires its filesystem permission for native subtitle-file commands; older IINA versions do not. The scoped token stays outside the repository. Ollama runs on `127.0.0.1:11434`. Hugging Face downloads are disabled during IINA playback.
 
+Python clients connect directly to validated loopback endpoints and allow redirects only within the same origin. A system HTTP proxy therefore does not receive these local service requests. Other applications' proxy settings are unchanged.
+
 See [architecture and protocol](docs/ARCHITECTURE.md) and the [security policy](SECURITY.md) for details.
 
 ## System audio overlay
@@ -212,7 +214,8 @@ To remove the integration, quit IINA, move `~/Library/LaunchAgents/local.live-tr
 | --- | --- |
 | No subtitle track | Reopen IINA after installation and enable **Переводить автоматически** in the plugin menu if you previously disabled it. |
 | Waiting after a seek | The requested section is being prepared. Cached sections and a fully prepared file need no inference. |
-| Ollama or model error | Start the local Ollama server and confirm the selected model appears in `ollama list`; rerun setup to download missing weights. |
+| Ollama or model error | Run the latest graphical installer and open **Show Details** for the reason. Setup reuses completed downloads and checks the local models before activation. |
+| Native model transfer rejected on a DNS/proxy route | The installer can fetch verified artifacts from the official registry and approved CDN. HTTPS validation and size/SHA-256 checks remain active; retry in the installer if a connection is interrupted. |
 | Service unavailable | Open the IINA launcher, check `/health`, and inspect `iina-worker.log` / `iina-worker.error.log` in the Application Support folder. |
 | High latency or memory use | Try a smaller locally compatible translation model. Keep other large inference jobs off the same GPU while measuring. |
 

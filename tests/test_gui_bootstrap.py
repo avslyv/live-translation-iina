@@ -2,6 +2,9 @@
 
 import io
 import json
+import ssl
+import sys
+import types
 from pathlib import Path
 from unittest import mock
 
@@ -96,8 +99,8 @@ def test_cached_translation_model_never_pulls_or_runs_inference(capsys):
             bootstrap, "local_json", return_value={"models": [{"name": bootstrap.TRANSLATOR}]}
         ) as local_json,
         mock.patch.object(
-            bootstrap.urllib.request,
-            "urlopen",
+            bootstrap,
+            "local_urlopen",
             side_effect=AssertionError("Unexpected model download"),
         ),
     ):
@@ -116,7 +119,7 @@ def test_translation_download_uses_pull_api_then_verifies_installed_tag(capsys):
             "local_json",
             side_effect=[{"models": []}, {"models": [{"name": bootstrap.TRANSLATOR}]}],
         ) as local_json,
-        mock.patch.object(bootstrap.urllib.request, "urlopen", return_value=response) as download,
+        mock.patch.object(bootstrap, "local_urlopen", return_value=response) as download,
     ):
         bootstrap.pull_translation_model(bootstrap.Reporter())
     request = download.call_args.args[0]
@@ -133,7 +136,7 @@ def test_incomplete_translation_download_produces_retry_instruction():
     with (
         mock.patch.object(bootstrap, "local_json", return_value={"models": []}),
         mock.patch.object(
-            bootstrap.urllib.request, "urlopen", return_value=io.BytesIO(b'{"status":"success"}\n')
+            bootstrap, "local_urlopen", return_value=io.BytesIO(b'{"status":"success"}\n')
         ),
         pytest.raises(RuntimeError, match="Retry to resume"),
     ):
@@ -144,8 +147,8 @@ def test_ollama_model_failure_preserves_actionable_reason():
     with (
         mock.patch.object(bootstrap, "local_json", return_value={"models": []}),
         mock.patch.object(
-            bootstrap.urllib.request,
-            "urlopen",
+            bootstrap,
+            "local_urlopen",
             return_value=io.BytesIO(b'{"error":"not enough disk space"}\n'),
         ),
         pytest.raises(RuntimeError, match="not enough disk space"),
@@ -282,4 +285,135 @@ def test_failed_venv_creation_restores_previous_runtime_even_when_target_is_miss
     assert run.call_args.args[0][1:3] == ["-m", "venv"]
     assert (environment / "keep.txt").read_text() == "working previous environment"
     assert (environment / "bin/python").read_text() == "previous interpreter fixture"
-    start_agent.assert_called_once_with(agent)
+    start_agent.assert_called_once_with(agent, bootstrap.BRIDGE_LABEL)
+
+
+@pytest.fixture
+def mocked_whisper_download(monkeypatch):
+    """A Hub stub that exercises progress without touching TLS or real weights."""
+    snapshot = mock.Mock()
+    hub = types.ModuleType("huggingface_hub")
+    hub.snapshot_download = snapshot
+    monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
+
+    class Tqdm:
+        def __init__(self, *args, **kwargs):
+            self.total = kwargs.get("total")
+            self.desc = kwargs.get("desc", "")
+            self.n = 0
+
+        def update(self, n=1):
+            self.n += n
+
+    tqdm = types.ModuleType("tqdm")
+    auto = types.ModuleType("tqdm.auto")
+    auto.tqdm = Tqdm
+    tqdm.auto = auto
+    monkeypatch.setitem(sys.modules, "tqdm", tqdm)
+    monkeypatch.setitem(sys.modules, "tqdm.auto", auto)
+    return snapshot
+
+
+def test_whisper_download_leaves_native_tls_context_unpatched(
+    mocked_whisper_download, monkeypatch, capsys
+):
+    # Hub 2.4/httpcore2 already uses the installed truststore on Darwin.
+    # A second, pip-vendored global wrapper was the cold-install regression.
+    vendor = types.ModuleType("pip._vendor")
+    vendor.truststore = mock.Mock()
+    vendor.truststore.inject_into_ssl.side_effect = AssertionError(
+        "A second global TLS wrapper must not be installed"
+    )
+    monkeypatch.setitem(sys.modules, "pip._vendor", vendor)
+    original_context = ssl.SSLContext
+    monkeypatch.setattr(bootstrap, "whisper_ready", lambda: True)
+
+    def download(*args, **kwargs):
+        progress = kwargs["tqdm_class"](total=1_000_002, desc="Verified model weights")
+        progress.update(500_001)
+
+    mocked_whisper_download.side_effect = download
+    bootstrap.download_whisper(bootstrap.Reporter())
+    assert ssl.SSLContext is original_context
+    vendor.truststore.inject_into_ssl.assert_not_called()
+    assert mocked_whisper_download.call_args.args == (bootstrap.WHISPER,)
+    assert mocked_whisper_download.call_args.kwargs["allow_patterns"] == [
+        "config.json",
+        "*.safetensors",
+        "weights.npz",
+    ]
+    assert events(capsys)[0]["stage"] == "speech-model"
+
+
+def test_hub_returning_without_complete_whisper_files_is_not_success(
+    mocked_whisper_download, monkeypatch
+):
+    monkeypatch.setattr(bootstrap, "whisper_ready", lambda: False)
+    with pytest.raises(RuntimeError, match="Whisper download is incomplete"):
+        bootstrap.download_whisper(bootstrap.Reporter())
+
+
+def test_whisper_cancellation_remains_distinct_from_download_failure(
+    mocked_whisper_download, monkeypatch
+):
+    mocked_whisper_download.side_effect = bootstrap.InstallationCancelled("stopped")
+    ready = mock.Mock()
+    monkeypatch.setattr(bootstrap, "whisper_ready", ready)
+    with pytest.raises(bootstrap.InstallationCancelled, match="stopped"):
+        bootstrap.download_whisper(bootstrap.Reporter())
+    ready.assert_not_called()
+
+
+def test_sigterm_handler_returns_cancel_status_without_failed_download_event(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setattr(bootstrap.sys, "argv", ["bootstrap.py"])
+    monkeypatch.setattr(bootstrap.Path, "home", classmethod(lambda cls: tmp_path))
+    signal_registration = mock.Mock()
+    monkeypatch.setattr(bootstrap.signal, "signal", signal_registration)
+
+    def stop(report):
+        handler = signal_registration.call_args.args[1]
+        handler(bootstrap.signal.SIGTERM, None)
+
+    monkeypatch.setattr(bootstrap, "install", stop)
+    assert bootstrap.main() == 130
+    signal_registration.assert_called_once()
+    emitted = events(capsys)
+    assert emitted[-1]["type"] == "log"
+    assert "cancelled" in emitted[-1]["message"]
+
+
+def test_network_redirect_failure_uses_verified_fallback_without_leaking_signed_url(
+    capsys, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    response = io.BytesIO(
+        b'{"error":"redirect target not allowed: https://vendor.example/data?Signature=SECRET resolves to non-public address"}\n'
+    )
+    with (
+        mock.patch.object(
+            bootstrap,
+            "local_json",
+            side_effect=[{"models": []}, {"models": [{"name": bootstrap.TRANSLATOR}]}],
+        ),
+        mock.patch.object(bootstrap, "local_urlopen", return_value=response),
+        mock.patch.object(bootstrap, "download_ollama_model") as fallback,
+    ):
+        report = bootstrap.Reporter()
+        bootstrap.pull_translation_model(report)
+    fallback.assert_called_once_with(bootstrap.TRANSLATOR, tmp_path / ".ollama/models", report)
+    assert "SECRET" not in capsys.readouterr().out
+
+
+def test_cancelled_native_model_download_does_not_start_fallback():
+    with (
+        mock.patch.object(bootstrap, "local_json", return_value={"models": []}),
+        mock.patch.object(
+            bootstrap, "native_model_pull", side_effect=bootstrap.InstallationCancelled("stop")
+        ),
+        mock.patch.object(bootstrap, "download_ollama_model") as fallback,
+        pytest.raises(bootstrap.InstallationCancelled),
+    ):
+        bootstrap.pull_translation_model(bootstrap.Reporter())
+    fallback.assert_not_called()

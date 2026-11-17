@@ -11,7 +11,7 @@ and `SHA256SUMS` are attached to the same GitHub release.
 ## Install
 
 1. Open the DMG, then open **Live Translation Installer.app**.
-2. Click **Install** and leave the disk image mounted while setup runs.
+2. Click **Install Everything** and leave the disk image mounted while setup runs.
 3. Wait for prerequisites and model downloads to finish. The window displays the
    current step, progress, and a detailed log.
 4. Quit and reopen IINA, then open a local English video. The installer also offers
@@ -48,6 +48,34 @@ sources and artifact identities are recorded in the installer manifests in this
 repository. Model weights retain their own licenses and are not bundled in the
 DMG or ZIP.
 
+## Networks and local services
+
+Setup normally asks the local Ollama server to download Gemma. On affected DNS
+routes, that native transfer can reject an official CDN destination. The installer
+then has a restricted download path for the official registry and its approved
+CDN: HTTPS destinations are validated before following redirects, artifacts are
+checked against their expected sizes and SHA-256 digests, and the manifest becomes
+available only after every artifact is verified. Bounded parallel ranges retain
+completed progress for a retry.
+
+TLS verification stays enabled. This path does not change system DNS, global
+proxy settings, or Ollama's own network protections. Whisper downloads use the
+pinned Hugging Face transport with macOS certificate trust.
+
+Python requests to the local Ollama and translation services connect directly to
+explicit loopback HTTP endpoints. They do not inherit a system HTTP proxy, and
+redirects must keep the same origin, including its port. Remote HTTPS downloads
+retain certificate verification.
+
+These paths are automatic; setup requires no Terminal commands or Homebrew.
+
+## Validation
+
+Cold-install validation is tracked separately from updates of an already prepared
+Mac. The [cold-install report](COLD_INSTALL_TEST.md) is the source for the current
+status, baseline checks, recorded results, and test limits. The earlier 1.3.0 GUI
+check reused installed dependencies and models; it was an upgrade test.
+
 ## Retry or update
 
 If a network request fails, read the detail shown in the installer and retry.
@@ -68,7 +96,7 @@ Maintainers can build the installer on an Apple silicon Mac with Xcode Command
 Line Tools and Python 3.12+:
 
 ```bash
-python3 tools/build_installer.py --version 1.3.0
+python3 tools/build_installer.py --version 1.3.1
 ```
 
 This creates an application bundle, a DMG, a ZIP, and `SHA256SUMS` in `dist/`.
@@ -82,7 +110,7 @@ build:
 
 ```bash
 python3 tools/build_installer.py \
-  --version 1.3.0 \
+  --version 1.3.1 \
   --sign-identity "Developer ID Application: Your Name (TEAMID)" \
   --notary-profile release-notary
 ```

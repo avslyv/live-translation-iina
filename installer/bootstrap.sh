@@ -4,6 +4,13 @@ set -euo pipefail
 umask 077
 export PYTHONDONTWRITEBYTECODE=1
 
+# The native window can launch a hermetic integration run without sandboxing
+# AppKit/LaunchServices itself. All setup work and descendants inherit it.
+if [ -n "${LT_SANDBOX_PROFILE:-}" ] && [ "${LT_INSTALLER_SANDBOX_ACTIVE:-}" != 1 ]; then
+    exec /usr/bin/env LT_INSTALLER_SANDBOX_ACTIVE=1 /usr/bin/sandbox-exec \
+        -f "$LT_SANDBOX_PROFILE" /bin/bash "$0" "$@"
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 if [ -d "$SCRIPT_DIR/payload/installer" ]; then
     PAYLOAD_DIR="$SCRIPT_DIR/payload"

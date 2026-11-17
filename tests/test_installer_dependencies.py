@@ -1,5 +1,6 @@
 """Verified prerequisite handling without network, installation or real media."""
 
+import errno
 import hashlib
 import io
 import json
@@ -187,6 +188,64 @@ def test_ffmpeg_reuses_working_install_without_network(tmp_path):
     ):
         assert dependencies.ensure_ffmpeg(tmp_path, tmp_path) == executable
     download.assert_not_called()
+
+
+@pytest.mark.parametrize("probe", ["stat", "access", "execute"])
+def test_unreadable_existing_binary_is_unavailable_at_every_probe_stage(tmp_path, probe):
+    executable = tmp_path / "ollama"
+    executable.write_bytes(b"existing")
+    executable.chmod(0o755)
+    denied = PermissionError(errno.EPERM, "Operation not permitted", str(executable))
+    targets = {
+        "stat": (Path, "is_file"),
+        "access": (dependencies.os, "access"),
+        "execute": (dependencies.subprocess, "run"),
+    }
+    target, attribute = targets[probe]
+    with mock.patch.object(target, attribute, side_effect=denied):
+        assert dependencies._working_binary(executable, "--version", "ollama") is False
+
+
+def test_unreadable_executable_search_is_treated_as_missing():
+    with mock.patch.object(
+        dependencies.shutil, "which", side_effect=PermissionError(errno.EPERM, "Host path denied")
+    ):
+        assert dependencies.find_executable("ollama") is None
+
+
+def test_ollama_provisions_private_runtime_when_host_app_stat_is_denied(tmp_path, monkeypatch):
+    blocked = Path("/Applications/Ollama.app/Contents/Resources/ollama")
+    archive = tmp_path / "ollama.tar.gz"
+    make_tar(archive, "ollama")
+    tools = tmp_path / "private-tools"
+    real_is_file = Path.is_file
+
+    def is_file(path):
+        if path == blocked:
+            raise PermissionError(errno.EPERM, "Host app denied", str(path))
+        return real_is_file(path)
+
+    def version(command, **kwargs):
+        assert command[0] != str(blocked)
+        return subprocess.CompletedProcess(command, 0, "ollama version fixture", "")
+
+    with (
+        mock.patch.object(dependencies, "find_executable", return_value=blocked),
+        mock.patch.object(dependencies, "download_artifact", return_value=archive) as download,
+        mock.patch.object(dependencies.subprocess, "run", side_effect=version),
+        mock.patch.object(Path, "is_file", is_file),
+    ):
+        result = dependencies.ensure_ollama(tmp_path / "cache", tools)
+    assert result.is_relative_to(tools)
+    assert result.read_bytes() == b"data"
+    download.assert_called_once()
+
+
+def test_unreadable_existing_iina_metadata_is_unavailable():
+    with mock.patch.object(
+        Path, "open", side_effect=PermissionError(errno.EPERM, "Host app denied")
+    ):
+        assert dependencies._working_iina(Path("/Applications/IINA.app")) is False
 
 
 def test_iina_reuses_compatible_app_without_replacing_it(tmp_path):

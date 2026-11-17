@@ -2,6 +2,7 @@
 
 import importlib.util
 import json
+import plistlib
 import subprocess
 import tempfile
 import unittest
@@ -60,6 +61,88 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual((destination / "iina_bridge.py").read_text(), "# updated worker")
             self.assertTrue(source.exists())
 
+    def test_runtime_backup_accepts_partial_source_but_payload_requires_worker(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "incomplete"
+            (source / "live_translation").mkdir(parents=True)
+            (source / "live_translation/__init__.py").write_text("# previous helper")
+            installer.copy_runtime(source, root / "backup", require_worker=False)
+            self.assertEqual(
+                (root / "backup/live_translation/__init__.py").read_text(),
+                "# previous helper",
+            )
+            with self.assertRaises(FileNotFoundError):
+                installer.copy_runtime(source, root / "runtime")
+
+    def test_first_install_preserves_prepared_venv_and_copies_real_runtime(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / "Fresh Home"
+            support = home / "Library/Application Support/LiveTranslate"
+            project = support / "project"
+            python = project / ".venv/bin/python"
+            python.parent.mkdir(parents=True)
+            python.write_text("prepared private Python environment")
+            python_inode = python.stat().st_ino
+            marker = project / ".venv/installed-dependencies"
+            marker.write_text("already installed")
+            self.assertFalse((project / "iina_bridge.py").exists())
+            iina = root / "IINA.app"
+            contents = iina / "Contents"
+            (contents / "MacOS").mkdir(parents=True)
+            (contents / "MacOS/IINA").touch()
+            (contents / "Info.plist").write_bytes(
+                plistlib.dumps({"CFBundleShortVersionString": "1.5.1"})
+            )
+            with (
+                mock.patch.dict(installer.os.environ, {"HOME": str(home)}, clear=True),
+                mock.patch.object(installer.platform, "system", return_value="Darwin"),
+                mock.patch.object(installer.platform, "machine", return_value="arm64"),
+                mock.patch.object(
+                    installer.platform, "mac_ver", return_value=("15.6.1", (), "arm64")
+                ),
+                mock.patch.object(installer, "command", return_value="/private/ffmpeg"),
+                mock.patch.object(installer, "optional_command", return_value=None),
+                mock.patch.object(installer.shutil, "which", return_value=None),
+                mock.patch.object(installer, "run") as run,
+                mock.patch.object(installer, "start_agent") as start,
+                mock.patch("builtins.print"),
+            ):
+                self.assertEqual(
+                    installer.main(["--iina", str(iina), "--no-launcher", "--start"]), 0
+                )
+            self.assertEqual(python.read_text(), "prepared private Python environment")
+            self.assertEqual(python.stat().st_ino, python_inode)
+            self.assertEqual(marker.read_text(), "already installed")
+            self.assertEqual(
+                (project / "iina_bridge.py").read_bytes(),
+                (installer.SOURCE / "iina_bridge.py").read_bytes(),
+            )
+            self.assertEqual(
+                (project / "live_translation/runtime_config.py").read_bytes(),
+                (installer.SOURCE / "live_translation/runtime_config.py").read_bytes(),
+            )
+            plugin = support / "iina-plugin"
+            plugin_info = json.loads((plugin / "Info.json").read_text())
+            self.assertIn("file-system", plugin_info["permissions"])
+            self.assertIn("function authToken() { return token; }", (plugin / "main.js").read_text())
+            plugin_link = (
+                home
+                / "Library/Application Support/com.colliderli.iina/plugins/iina-plugin.iinaplugin-dev"
+            )
+            self.assertEqual(plugin_link.resolve(), plugin.resolve())
+            agent = home / "Library/LaunchAgents/local.live-translation.iina.plist"
+            service = plistlib.loads(agent.read_bytes())
+            self.assertEqual(
+                service["ProgramArguments"], [str(python), str(project / "iina_bridge.py")]
+            )
+            self.assertEqual(service["EnvironmentVariables"]["HOME"], str(home))
+            start.assert_called_once_with(agent)
+            self.assertFalse(
+                any("pip" in call.args or "venv" in call.args for call in run.call_args_list)
+            )
+
     def test_launch_agent_uses_resolved_executables_and_offline_models(self):
         service = installer.launch_agent(
             Path("/Users/example/Runtime"),
@@ -88,6 +171,131 @@ class InstallerTests(unittest.TestCase):
         )
         self.assertEqual(service["EnvironmentVariables"]["LT_FFMPEG"], "/portable/ffmpeg")
         self.assertNotIn("LT_FFPROBE", service["EnvironmentVariables"])
+
+    def test_separate_instance_keeps_launchd_home_caches_ports_and_sandbox_explicit(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / "Fresh Home"
+            profile = root / "clean.sb"
+            profile.write_text("(version 1)\n")
+            with mock.patch.dict(
+                installer.os.environ,
+                {
+                    "HOME": str(home),
+                    "LT_INSTANCE_ID": "local.live-translation.clean-test",
+                    "LT_BRIDGE_PORT": "18784",
+                    "LT_OLLAMA_PORT": "11484",
+                    "LT_SANDBOX_PROFILE": str(profile),
+                },
+                clear=True,
+            ):
+                service = installer.launch_agent(
+                    home / "Runtime",
+                    home / "Support",
+                    "/portable/ffmpeg",
+                    None,
+                    "test/whisper",
+                    "test-model:12b",
+                )
+            self.assertEqual(service["Label"], "local.live-translation.clean-test.iina")
+            self.assertEqual(
+                service["ProgramArguments"][:3], ["/usr/bin/sandbox-exec", "-f", str(profile)]
+            )
+            self.assertEqual(
+                service["ProgramArguments"][3:],
+                [str(home / "Runtime/.venv/bin/python"), str(home / "Runtime/iina_bridge.py")],
+            )
+            environment = service["EnvironmentVariables"]
+            self.assertEqual(environment["HOME"], str(home))
+            self.assertEqual(environment["CFFIXED_USER_HOME"], str(home))
+            self.assertEqual(environment["HF_HOME"], str(home / ".cache/huggingface"))
+            self.assertEqual(environment["HF_HUB_CACHE"], str(home / ".cache/huggingface/hub"))
+            self.assertEqual(environment["OLLAMA_MODELS"], str(home / ".ollama/models"))
+            self.assertEqual(environment["LT_BRIDGE_PORT"], "18784")
+            self.assertEqual(environment["LT_OLLAMA_PORT"], "11484")
+            self.assertEqual(environment["LT_SANDBOX_PROFILE"], str(profile))
+
+    def test_rendered_plugin_connects_only_to_the_configured_instance(self):
+        source = (installer.SOURCE / "iina-plugin/main.js").read_text()
+        with mock.patch.dict(installer.os.environ, {"LT_BRIDGE_PORT": "18784"}):
+            rendered = installer.render_plugin(source, "test-scoped-token")
+        self.assertIn('const SERVICE_URL = "http://127.0.0.1:18784/state";', rendered)
+        self.assertNotIn("127.0.0.1:18743", rendered)
+
+    def test_launcher_uses_its_instance_label_and_explicit_environment(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / "Fresh Home"
+            app = home / "Applications/Test Launcher.app"
+            with (
+                mock.patch.dict(
+                    installer.os.environ,
+                    {
+                        "HOME": str(home),
+                        "LT_INSTANCE_ID": "local.live-translation.clean-test",
+                        "LT_BRIDGE_PORT": "18784",
+                        "LT_OLLAMA_PORT": "11484",
+                    },
+                    clear=True,
+                ),
+                mock.patch.object(installer, "run"),
+            ):
+                installer.install_launcher(
+                    app,
+                    home / "Applications/IINA.app",
+                    home / "Library/LaunchAgents/clean.plist",
+                    {"identifier": "test.plugin", "version": "1.3.0"},
+                    root / "Backup",
+                )
+            script = (app / "Contents/MacOS/LiveTranslationIINA").read_text()
+            self.assertIn("local.live-translation.clean-test.iina", script)
+            self.assertNotIn('/local.live-translation.iina"', script)
+            self.assertIn("export LT_BRIDGE_PORT=18784", script)
+            self.assertIn("export LT_OLLAMA_PORT=11484", script)
+            self.assertIn("export CFFIXED_USER_HOME=", script)
+            self.assertIn(str(home), script)
+
+    def test_preference_writes_target_the_computed_home_file_not_the_login_domain(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / "Fresh Home"
+            iina = root / "IINA.app"
+            contents = iina / "Contents"
+            (contents / "MacOS").mkdir(parents=True)
+            (contents / "MacOS/IINA").touch()
+            (contents / "Info.plist").write_bytes(
+                plistlib.dumps({"CFBundleShortVersionString": "1.5.1"})
+            )
+            python = home / "Library/Application Support/LiveTranslate/project/.venv/bin/python"
+            python.parent.mkdir(parents=True)
+            python.touch()
+            with (
+                mock.patch.dict(installer.os.environ, {"HOME": str(home)}, clear=True),
+                mock.patch.object(installer.platform, "system", return_value="Darwin"),
+                mock.patch.object(installer.platform, "machine", return_value="arm64"),
+                mock.patch.object(
+                    installer.platform, "mac_ver", return_value=("15.6.1", (), "arm64")
+                ),
+                mock.patch.object(installer, "command", return_value="/private/ffmpeg"),
+                mock.patch.object(installer, "optional_command", return_value=None),
+                mock.patch.object(installer, "copy_runtime"),
+                mock.patch.object(installer, "atomic_write"),
+                mock.patch.object(installer, "run") as run,
+                mock.patch("builtins.print"),
+            ):
+                self.assertEqual(installer.main(["--iina", str(iina), "--no-launcher"]), 0)
+            writes = [
+                call.args
+                for call in run.call_args_list
+                if call.args[:2] == ("/usr/bin/defaults", "write")
+            ]
+            self.assertEqual(len(writes), 2)
+            self.assertTrue(
+                all(
+                    call[2] == str(home / "Library/Preferences/com.colliderli.iina")
+                    for call in writes
+                )
+            )
 
     def test_environment_override_selects_the_private_ffmpeg(self):
         with (
@@ -160,6 +368,17 @@ class InstallerTests(unittest.TestCase):
             installer.start_agent(Path("/example/agent.plist"))
         self.assertEqual(raised.exception.returncode, 125)
         sleep.assert_not_called()
+
+    def test_start_agent_default_label_respects_the_instance_namespace(self):
+        ok = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        with (
+            mock.patch.dict(installer.os.environ, {"LT_INSTANCE_ID": "local.clean-test"}),
+            mock.patch.object(installer.subprocess, "run", return_value=ok) as process,
+        ):
+            installer.start_agent(Path("/example/agent.plist"))
+        commands = [list(call.args[0]) for call in process.call_args_list]
+        self.assertTrue(commands[0][-1].endswith("/local.clean-test.iina"))
+        self.assertEqual(commands[1][-1], commands[0][-1])
 
     def test_dry_run_never_writes_or_starts_a_process(self):
         with (
