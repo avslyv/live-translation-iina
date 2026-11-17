@@ -2,7 +2,7 @@
 
 ## Supported version
 
-Security fixes target the latest `1.2.x` IINA integration on the default branch.
+Security fixes target the latest `1.3.x` IINA integration on the default branch.
 The upstream system-audio overlay is retained; changes to it are reviewed as part
 of this repository, but this project cannot provide fixes for upstream dependencies.
 
