@@ -1,12 +1,15 @@
 {
-  "name": "Локальные русские субтитры",
+  "name": "Локальный перевод",
   "identifier": "local.artem.live-translation",
-  "version": "1.3.2",
+  "version": "1.4.0",
   "author": {
     "name": "avslyv"
   },
-  "description": "Локальный перевод английской речи в обычную дорожку субтитров IINA.",
+  "description": "Локальный перевод речи и текстовых субтитров в обычные дорожки IINA.",
   "entry": "main.js",
+  "sidebarTab": {
+    "name": "Перевод"
+  },
   "permissions": [
     "network-request",
     "file-system",

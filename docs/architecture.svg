@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1120" height="760" viewBox="0 0 1120 760" fill="none" role="img" aria-labelledby="title description">
   <title id="title">IINA translation architecture</title>
-  <desc id="description">A local video file flows through FFmpeg, Whisper on MLX, and Gemma through Ollama. A persistent JSON and SRT cache feeds a native IINA subtitle track. Playback seeks return to a priority queue that prepares the current position first, then the next 180 seconds, then the remaining gaps. All audio processing runs on the Mac.</desc>
+  <desc id="description">Local text subtitles bypass speech recognition. Selected internal audio flows through FFmpeg, optional local Silero, and multilingual Whisper on MLX. Both sources feed fixed source context and glossary into structured Ollama batches. Versioned JSON and SRT caches feed native translation and optional original tracks. The sidebar controls settings and saved versions. One asynchronous worker prioritizes the playhead, the next 180 seconds, then remaining gaps for one active video.</desc>
   <defs>
     <linearGradient id="background" x1="0" y1="0" x2="1120" y2="760" gradientUnits="userSpaceOnUse">
       <stop stop-color="#101923"/>
@@ -22,7 +22,7 @@
   <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
     <text x="48" y="47" fill="#83CDEE" font-size="13" font-weight="700" letter-spacing="2">LIVE TRANSLATION · IINA</text>
     <text x="48" y="91" fill="#F2F6FB" font-size="34" font-weight="650" letter-spacing="-0.7">IINA translation architecture</text>
-    <text x="48" y="121" fill="#ABB9CA" font-size="18">Local models. Persistent subtitles. Playback stays in sync.</text>
+    <text x="48" y="121" fill="#ABB9CA" font-size="18">Text first. Local models. Persistent native subtitles.</text>
     <path d="M48 139H1072" stroke="#293746"/>
 
     <!-- The dashed return path represents playback control, not audio. -->
@@ -35,25 +35,28 @@
       <path d="M928 320V390"/>
       <path d="M784 472H714"/>
       <path d="M416 472H346"/>
+      <path d="M560 320V360H832V390"/>
     </g>
-    <text x="950" y="361" fill="#91A5BA" font-size="14">English text</text>
+    <text x="716" y="237" fill="#91A5BA" font-size="12">Audio</text>
+    <text x="581" y="350" fill="#83CDEE" font-size="14">Text skips recognition</text>
+    <text x="950" y="361" fill="#91A5BA" font-size="14">Source cues</text>
 
     <g transform="translate(48 176)">
       <rect width="288" height="144" rx="16" fill="url(#card)" stroke="#334558"/>
       <text x="24" y="31" fill="#83CDEE" font-size="13" font-weight="700" letter-spacing="1.5">01 · INPUT</text>
       <path d="M244 21V43L263 32Z" stroke="#83CDEE" stroke-width="1.8" stroke-linejoin="round"/>
-      <text x="24" y="70" fill="#F2F6FB" font-size="26" font-weight="600">Local video</text>
-      <text x="24" y="101" fill="#ABB9CA" font-size="17">Read directly from the file</text>
-      <text x="24" y="125" fill="#ABB9CA" font-size="17">Stable media timestamps</text>
+      <text x="24" y="70" fill="#F2F6FB" font-size="26" font-weight="600">Local sources</text>
+      <text x="24" y="101" fill="#ABB9CA" font-size="17">Text subtitles preferred</text>
+      <text x="24" y="125" fill="#ABB9CA" font-size="17">Selected internal audio</text>
     </g>
 
     <g transform="translate(416 176)">
       <rect width="288" height="144" rx="16" fill="url(#card)" stroke="#334558"/>
-      <text x="24" y="31" fill="#83CDEE" font-size="13" font-weight="700" letter-spacing="1.5">02 · DECODE</text>
+      <text x="24" y="31" fill="#83CDEE" font-size="13" font-weight="700" letter-spacing="1.5">02 · PREPARE</text>
       <path d="M238 32H243L247 23 252 41 257 27 261 32H267" stroke="#83CDEE" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
-      <text x="24" y="70" fill="#F2F6FB" font-size="26" font-weight="600">FFmpeg</text>
-      <text x="24" y="101" fill="#ABB9CA" font-size="17">First audio track · 16 kHz</text>
-      <text x="24" y="125" fill="#ABB9CA" font-size="17">Fixed 30-second chunks</text>
+      <text x="24" y="70" fill="#F2F6FB" font-size="26" font-weight="600">Text / FFmpeg</text>
+      <text x="24" y="101" fill="#ABB9CA" font-size="16">Parse text or decode 16 kHz</text>
+      <text x="24" y="125" fill="#ABB9CA" font-size="16">Optional Silero · off by default</text>
     </g>
 
     <g transform="translate(784 176)">
@@ -62,8 +65,8 @@
       <rect x="243" y="23" width="18" height="18" rx="4" stroke="#83CDEE" stroke-width="1.8"/>
       <path d="M248 18V23M256 18V23M248 41V46M256 41V46M238 28H243M238 36H243M261 28H266M261 36H266" stroke="#83CDEE" stroke-width="1.8" stroke-linecap="round"/>
       <text x="24" y="70" fill="#F2F6FB" font-size="26" font-weight="600">Whisper / MLX</text>
-      <text x="24" y="101" fill="#ABB9CA" font-size="17">English speech → timed text</text>
-      <text x="24" y="125" fill="#ABB9CA" font-size="17">Apple silicon GPU</text>
+      <text x="24" y="101" fill="#ABB9CA" font-size="17">Audio only · 11 languages</text>
+      <text x="24" y="125" fill="#ABB9CA" font-size="17">Full multilingual Turbo</text>
     </g>
 
     <g transform="translate(784 400)">
@@ -71,8 +74,8 @@
       <text x="24" y="31" fill="#C9B9F4" font-size="13" font-weight="700" letter-spacing="1.5">04 · TRANSLATE</text>
       <path d="M242 22H265V38H254L247 44V38H242Z" stroke="#C9B9F4" stroke-width="1.8" stroke-linejoin="round"/>
       <text x="24" y="70" fill="#F2F6FB" font-size="26" font-weight="600">Gemma / Ollama</text>
-      <text x="24" y="101" fill="#ABB9CA" font-size="17">Context within each chunk</text>
-      <text x="24" y="125" fill="#ABB9CA" font-size="17">Fixed seed · greedy decoding</text>
+      <text x="24" y="101" fill="#ABB9CA" font-size="16">Fixed source context + glossary</text>
+      <text x="24" y="125" fill="#ABB9CA" font-size="16">JSON batches 1 / 4 · seed 42</text>
     </g>
 
     <g transform="translate(416 400)">
@@ -81,8 +84,8 @@
       <ellipse cx="253" cy="24" rx="12" ry="4" stroke="#C9B9F4" stroke-width="1.8"/>
       <path d="M241 24V40C241 45 265 45 265 40V24M241 32C241 37 265 37 265 32" stroke="#C9B9F4" stroke-width="1.8"/>
       <text x="24" y="70" fill="#F2F6FB" font-size="26" font-weight="600">JSON + SRT cache</text>
-      <text x="24" y="101" fill="#ABB9CA" font-size="17">Video content + model profile</text>
-      <text x="24" y="125" fill="#ABB9CA" font-size="17">Reuse completed translations</text>
+      <text x="24" y="101" fill="#ABB9CA" font-size="16">Versioned profiles · offline reuse</text>
+      <text x="24" y="125" fill="#ABB9CA" font-size="16">Complete chunks are durable</text>
     </g>
 
     <g transform="translate(48 400)">
@@ -90,22 +93,22 @@
       <text x="24" y="31" fill="#8ED9B4" font-size="13" font-weight="700" letter-spacing="1.5">06 · WATCH</text>
       <rect x="239" y="21" width="27" height="22" rx="5" stroke="#8ED9B4" stroke-width="1.8"/>
       <path d="M250 28C244 24 244 39 250 35M261 28C255 24 255 39 261 35" stroke="#8ED9B4" stroke-width="1.8" stroke-linecap="round"/>
-      <text x="24" y="70" fill="#F2F6FB" font-size="26" font-weight="600">Native IINA subtitles</text>
-      <text x="24" y="101" fill="#B2C7BB" font-size="17">A regular Russian SRT track</text>
-      <text x="24" y="125" fill="#B2C7BB" font-size="17">Your subtitle appearance</text>
+      <text x="24" y="70" fill="#F2F6FB" font-size="26" font-weight="600">Native IINA tracks</text>
+      <text x="24" y="101" fill="#B2C7BB" font-size="16">Translation + optional original</text>
+      <text x="24" y="125" fill="#B2C7BB" font-size="16">Sidebar: settings + cache</text>
     </g>
 
     <path d="M312 544V660H406" stroke="#E8BD7D" stroke-width="2" stroke-dasharray="5 7" stroke-linejoin="round" marker-end="url(#seek-arrow)"/>
-    <text x="48" y="593" fill="#E8BD7D" font-size="17" font-weight="600">Playback seeks</text>
-    <text x="48" y="619" fill="#ABB9CA" font-size="16">Wait for a missing section,</text>
-    <text x="48" y="642" fill="#ABB9CA" font-size="16">then resume automatically.</text>
+    <text x="48" y="593" fill="#E8BD7D" font-size="17" font-weight="600">Seeks + settings</text>
+    <text x="48" y="619" fill="#ABB9CA" font-size="15">Optional wait, then resume.</text>
+    <text x="48" y="642" fill="#ABB9CA" font-size="15">Hashing runs off HTTP threads.</text>
 
     <g transform="translate(416 608)">
       <rect width="656" height="104" rx="16" fill="#211F1B" stroke="#66543B"/>
-      <text x="24" y="39" fill="#F2F6FB" font-size="24" font-weight="600">Seek-aware priority queue</text>
-      <text x="24" y="73" fill="#D2C2AA" font-size="18">Current position → next 180 seconds → remaining gaps</text>
+      <text x="24" y="39" fill="#F2F6FB" font-size="24" font-weight="600">One active video · worker queue</text>
+      <text x="24" y="73" fill="#D2C2AA" font-size="18">Playhead → next 180 seconds → remaining gaps</text>
     </g>
 
-    <text x="48" y="739" fill="#8295AA" font-size="14">Architecture diagram · All audio processing runs locally on your Mac.</text>
+    <text x="48" y="739" fill="#8295AA" font-size="14">All processing stays on your Mac · Source-aware cache · Native IINA rendering</text>
   </g>
 </svg>

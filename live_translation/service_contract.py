@@ -5,10 +5,10 @@ from __future__ import annotations
 import os
 import re
 
-SERVICE_VERSION = "1.3.2"
+SERVICE_VERSION = "1.4.0"
 SERVICE_NAME = "iina-local-translation"
 PROTOCOL_VERSION = 1
-CAPABILITIES = ("state_form", "native_srt", "auto_restart")
+CAPABILITIES = ("state_form", "native_srt", "auto_restart", "subtitle_sources", "sidebar_control", "bilingual")
 
 
 def service_identity(runtime_id: str, *, process_id: int | None = None) -> dict:

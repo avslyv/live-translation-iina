@@ -92,7 +92,7 @@ def render_plugin(source: str, token: str) -> str:
         'const SERVICE_URL = "http://127.0.0.1:18743/state";': "const SERVICE_URL = "
         + json.dumps(config.bridge_url + "/state")
         + ";",
-        "const { console, core, event, file, http, menu, mpv, preferences }": "const { console, core, event, http, menu, mpv, preferences }",
+        "const { console, core, event, file, http, menu, mpv, preferences, sidebar }": "const { console, core, event, http, menu, mpv, preferences, sidebar }",
         'let token = "";': "let token = " + json.dumps(token) + ";",
         " || !file.exists(path)": "",
         "path && file.exists(path)": "path",
@@ -120,6 +120,10 @@ def copy_runtime(source: Path, destination: Path, *, require_worker: bool = True
         if (source / name).exists():
             files.append(source / name)
     files.extend(sorted((source / "live_translation").glob("*.py")))
+    for name in ("silero_vad.jit", "silero.json", "SILERO_LICENSE"):
+        asset = source / "live_translation/assets" / name
+        if asset.is_file():
+            files.append(asset)
     for path in files:
         atomic_write(destination / path.relative_to(source), path.read_bytes(), 0o644)
 
@@ -382,6 +386,9 @@ def main(argv: list[str] | None = None) -> int:
         info = installed_plugin_metadata(info, tuple(int(part or 0) for part in match.groups()))
         code = render_plugin((SOURCE / "iina-plugin/main.js").read_text(), token)
         atomic_write(installed_plugin / "main.js", code.encode())
+        for asset in (SOURCE / "iina-plugin").iterdir():
+            if asset.is_file() and asset.suffix in {".html", ".css", ".js"} and asset.name != "main.js":
+                atomic_write(installed_plugin / asset.name, asset.read_bytes())
         atomic_write(
             installed_plugin / "Info.json",
             (json.dumps(info, ensure_ascii=False, indent=2) + "\n").encode(),

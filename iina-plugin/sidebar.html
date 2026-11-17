@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'none'; img-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>Локальный перевод</title>
+  <link rel="stylesheet" href="sidebar.css">
+</head>
+<body>
+  <main>
+    <header class="heading">
+      <div><p class="eyebrow"><span class="local-dot"></span> На вашем Mac</p><h1>Перевод</h1></div>
+      <label class="switch" title="Переводить автоматически"><input id="enabled" type="checkbox" aria-label="Переводить автоматически"><span></span></label>
+    </header>
+    <section class="status-card" aria-label="Состояние перевода">
+      <div class="status-top"><span id="connection" class="badge">Подключение</span><span id="progress-value" class="muted">0%</span></div>
+      <h2 id="status-title">Подключаю локальный перевод…</h2>
+      <p id="file-name" class="file-name">Откройте видео в IINA</p>
+      <div id="coverage" class="coverage" role="img" aria-label="Готовые участки перевода"><span id="playhead" class="playhead"></span></div>
+      <p id="status-detail" class="muted small">Перевод появится в обычной дорожке субтитров.</p>
+      <div class="status-meta"><span id="source-info">Источник пока не выбран</span><span id="model-info">Локальная модель</span></div>
+      <p id="pipeline-error" class="error" hidden></p>
+      <button id="retry" class="secondary compact" type="button" hidden>Повторить подготовку</button>
+    </section>
+    <nav class="tabs" aria-label="Разделы перевода">
+      <button type="button" data-tab="translate" aria-pressed="true">Настройки</button>
+      <button type="button" data-tab="cache" aria-pressed="false">Кэш <span id="cache-count">0</span></button>
+    </nav>
+    <section id="tab-translate">
+      <form id="settings-form">
+        <section class="settings-section">
+          <h2>Источник перевода</h2>
+          <label for="source_mode">Что переводить</label>
+          <select id="source_mode"><option value="auto">Автоматически</option><option value="subtitles">Текстовые субтитры</option><option value="audio">Звук</option></select>
+          <p id="source-hint" class="hint">Сначала используются субтитры на выбранном языке. Если подходящей дорожки нет — распознаётся речь.</p>
+          <div class="columns">
+            <div><label for="source_language">Язык оригинала</label><select id="source_language"><option value="en">Английский</option></select></div>
+            <div><label for="target_language">Язык перевода</label><select id="target_language"><option value="ru">Русский</option></select></div>
+          </div>
+        </section>
+        <section class="settings-section">
+          <div class="section-title"><h2>Локальная модель</h2><button id="refresh" type="button" class="text-button" aria-label="Обновить список моделей">Обновить</button></div>
+          <label for="translation_model" class="visually-hidden">Модель перевода</label>
+          <select id="translation_model"><option value="">Загружаю список…</option></select>
+          <p class="hint">Для перевода нужна установленная локальная модель.</p>
+          <p id="model-error" class="error small" role="status" hidden></p>
+        </section>
+        <section class="settings-section options">
+          <label class="check-row"><input id="bilingual" type="checkbox"><span><strong>Оригинал и перевод</strong><small id="bilingual-hint">Оригинал появится во второй дорожке IINA, если она свободна.</small></span></label>
+          <label class="check-row"><input id="wait_for_translation" type="checkbox"><span><strong>Ждать перевод при перемотке</strong><small>Видео продолжится, когда субтитры для нового участка будут готовы.</small></span></label>
+        </section>
+        <details class="settings-section advanced">
+          <summary>Распознавание и производительность</summary>
+          <label for="vad_mode">Экспериментальная фильтрация тишины</label>
+          <select id="vad_mode"><option value="off">Выключена</option><option value="conservative">Осторожная фильтрация</option></select>
+          <p class="hint">Silero проверяет, есть ли речь в участке. Очень тихая речь может быть пропущена.</p>
+          <label for="batch_size">Реплик в запросе</label>
+          <select id="batch_size"><option value="1">1</option><option value="4">4</option></select>
+        </details>
+        <details class="settings-section advanced">
+          <summary>Словарь перевода</summary>
+          <label for="glossary">Имена, термины и их перевод</label>
+          <textarea id="glossary" rows="4" maxlength="40000" placeholder="machine learning → машинное обучение"></textarea>
+          <p class="hint">По одной паре в строке: оригинал → перевод.</p>
+        </details>
+        <div class="save-row"><span id="draft-status" class="muted small"></span><button id="save" class="primary" type="submit">Сохранить</button></div>
+      </form>
+    </section>
+    <section id="tab-cache" hidden>
+      <div class="section-title cache-heading"><h2>Сохранённые версии</h2><button id="refresh-cache" type="button" class="text-button">Обновить</button></div>
+      <p class="hint">Выберите готовую версию, чтобы использовать её без повторного перевода.</p>
+      <div id="cache-list"></div>
+      <p id="cache-empty" class="empty">Сохранённых версий пока нет. Они появятся по мере подготовки перевода.</p>
+    </section>
+    <p id="operation-message" class="operation-message" role="status" aria-live="polite"></p>
+    <footer>Аудио и перевод обрабатываются локально.<br>Субтитры отображает IINA.</footer>
+  </main>
+  <script src="sidebar.js"></script>
+</body>
+</html>

@@ -1,8 +1,9 @@
 /* IINA 1.3.5+ bridge: real external subtitle track, no custom video overlay. */
-const { console, core, event, file, http, menu, mpv, preferences } = iina;
+const { console, core, event, file, http, menu, mpv, preferences, sidebar } = iina;
 
 const SERVICE_URL = "http://127.0.0.1:18743/state";
 const HEALTH_URL = SERVICE_URL.replace(/\/state$/, "/health");
+const CONTROL_URL = SERVICE_URL.replace(/\/state$/, "/control");
 const TOKEN_PATH = "~/Library/Application Support/LiveTranslate/iina-token";
 const TRACK_TITLE = "Русский · Live Translation (локально)";
 const CHUNK_SECONDS = 30;
@@ -35,6 +36,294 @@ let followRussian = true;
 let serviceReady = false;
 let serviceRuntime = "";
 let serviceFailures = 0;
+const clientId = "iina-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2);
+let requestSequence = 0;
+let sourceSubtitleId = null;
+let sourceSelectionKey = "";
+let backendSourceRevision = null;
+let selectedCacheKey = "";
+let originalPath = "";
+let originalRevision = -1;
+let secondaryHiddenByUser = false;
+let secondaryReplacedByUser = false;
+let sidebarLoaded = false;
+let sidebarReady = false;
+let sidebarDescription = { settings: {}, models: [], cache: [], languages: {}, model_error: "" };
+let sidebarOperation = { busy: false, error: "", requestId: "", action: "" };
+let sidebarQueue = [];
+
+function settings() {
+  return sidebarDescription.settings || {};
+}
+
+function generatedTrack(track) {
+  const path = normalizePath(track && track["external-filename"]);
+  return Boolean(track && track.type === "sub" && (
+    (path && (path === subtitlePath || path === originalPath || path.indexOf("/LiveTranslate/subtitles/") >= 0)) ||
+    String(track.title || "").indexOf("Live Translation") >= 0
+  ));
+}
+
+function trackId(value) {
+  const number = Number(value);
+  return value !== "" && Number.isInteger(number) && number > 0 ? number : null;
+}
+
+function selectedSource() {
+  const list = tracks().filter(track => !generatedTrack(track));
+  const subs = list.filter(track => track.type === "sub");
+  const selected = subs.find(track => String(track.id) === currentSid());
+  if (selected) sourceSubtitleId = trackId(selected.id);
+  if (!subs.some(track => track.id === sourceSubtitleId)) {
+    // With no explicit native choice, the backend chooses an auto source using
+    // the configured language. Never silently nominate an English fallback.
+    const preferred = settings().source_mode === "subtitles" ? subs[0] : null;
+    sourceSubtitleId = preferred ? trackId(preferred.id) : null;
+  }
+  const audio = list.filter(track => track.type === "audio");
+  const audioId = trackId(mpv.getString("aid")) ||
+    trackId((audio.find(track => track.selected) || audio[0] || {}).id);
+  return {
+    mode: settings().source_mode || "auto",
+    subtitle_track_id: sourceSubtitleId,
+    audio_track_id: audioId,
+    tracks: list,
+    subtitle_delay: Number(mpv.getNumber("sub-delay")) || 0,
+    audio_delay: Number(mpv.getNumber("audio-delay")) || 0
+  };
+}
+
+function selectionKey(selection) {
+  return JSON.stringify([selection.mode, selection.subtitle_track_id, selection.audio_track_id,
+    selection.subtitle_delay, selection.audio_delay]);
+}
+
+function clearGeneratedTracks() {
+  const primary = subtitlePath ? ownTrack(subtitlePath) : null;
+  const original = originalPath ? ownTrack(originalPath) : null;
+  changeSubtitles(() => {
+    if (primary && currentSid() === String(primary.id)) {
+      mpv.set("sid", sidStillExists(previousSid) ? previousSid : "no");
+    }
+    if (original && String(mpv.getString("secondary-sid")) === String(original.id)) {
+      mpv.set("secondary-sid", "no");
+    }
+    if (primary) mpv.command("sub-remove", [String(primary.id)]);
+    if (original && (!primary || original.id !== primary.id)) {
+      mpv.command("sub-remove", [String(original.id)]);
+    }
+  });
+  subtitlePath = "";
+  originalPath = "";
+  revision = -1;
+  originalRevision = -1;
+}
+
+function invalidateSource() {
+  const current = subtitlePath ? ownTrack(subtitlePath) : null;
+  if (current && (currentSid() !== String(current.id) || !mpv.getFlag("sub-visibility"))) {
+    followRussian = false;
+    wantSelect = false;
+  }
+  releaseBuffer(true);
+  clearGeneratedTracks();
+  epoch += 1;
+  seekGeneration += 1;
+  requestSequence += 1;
+  busy = false;
+  selectedCacheKey = "";
+  backendSourceRevision = null;
+  state = null;
+  bufferBypass = null;
+  internalRefresh = null;
+  if (followRussian) wantSelect = true;
+  urgentTick = true;
+  retryAfter = 0;
+}
+
+function onSourceChanged() {
+  if (closed || !mediaPath || changingSubtitles) return;
+  const next = selectionKey(selectedSource());
+  if (sourceSelectionKey && next !== sourceSelectionKey) invalidateSource();
+  sourceSelectionKey = next;
+  publishSidebar();
+  tick();
+}
+
+function languageName(code) {
+  const languages = sidebarDescription.languages || {};
+  if (!Array.isArray(languages) && typeof languages[code] === "string") return languages[code];
+  const item = Array.isArray(languages)
+    ? languages.find(value => value && (value.code === code || value.id === code)) : null;
+  return item ? String(item.label || item.name || code) : ({ ru: "Русский", en: "Английский" }[code] || code);
+}
+
+function applyOriginal(result) {
+  const path = normalizePath(result.original_path);
+  const previous = originalPath ? ownTrack(originalPath) : null;
+  if (!settings().bilingual) {
+    if (previous) changeSubtitles(() => {
+      if (String(mpv.getString("secondary-sid")) === String(previous.id)) mpv.set("secondary-sid", "no");
+      mpv.command("sub-remove", [String(previous.id)]);
+    });
+    originalPath = "";
+    originalRevision = -1;
+    return;
+  }
+  if (!path || secondaryHiddenByUser || secondaryReplacedByUser) return;
+  const secondary = String(mpv.getString("secondary-sid") || "no");
+  if (secondary !== "no" && secondary !== "0" && secondary !== "" &&
+      (!previous || secondary !== String(previous.id))) return;
+  changeSubtitles(() => {
+    const primarySid = currentSid();
+    let track = ownTrack(path);
+    let changed = false;
+    if (!track) {
+      mpv.command("sub-add", [path, "auto", "Оригинал · Live Translation (локально)",
+        result.source_language && result.source_language !== "auto" ? result.source_language : "und"]);
+      track = ownTrack(path);
+      changed = true;
+    } else if (originalPath !== path || originalRevision !== Number(result.revision)) {
+      mpv.command("sub-reload", [String(track.id)]);
+      track = ownTrack(path);
+      changed = true;
+    }
+    if (!track) return;
+    mpv.set("secondary-sid", String(track.id));
+    if (!previous) mpv.set("secondary-sub-visibility", true);
+    if (sidStillExists(primarySid)) mpv.set("sid", primarySid);
+    if (previous && previous.id !== track.id) mpv.command("sub-remove", [String(previous.id)]);
+    originalPath = path;
+    originalRevision = Number(result.revision);
+    if (changed && mpv.getFlag("pause")) {
+      internalRefresh = { file: mediaPath, position: currentPosition(), until: Date.now() + 1200 };
+      mpv.command("seek", ["0", "relative+exact"]);
+    }
+  });
+}
+
+function onSecondaryChanged(property) {
+  if (changingSubtitles || !originalPath) return;
+  const track = ownTrack(originalPath);
+  if (!track) return;
+  if (property === "secondary-sub-visibility") secondaryHiddenByUser = !mpv.getFlag(property);
+  else secondaryReplacedByUser = String(mpv.getString("secondary-sid")) !== String(track.id);
+  publishSidebar();
+}
+
+// IINA 1.3–1.5 interpolate WebView messages into a template literal. Keep every
+// untrusted string inside a second JSON envelope without $, backticks or Unicode.
+function safeSidebarEnvelope(value) {
+  return { json: JSON.stringify(value).replace(/[^\x20-\x7e]|[$`]/g, character =>
+    "\\u" + character.charCodeAt(0).toString(16).padStart(4, "0")) };
+}
+
+function publishSidebar() {
+  if (!sidebarReady || !sidebar) return;
+  try {
+    const secondId = String(mpv.getString("secondary-sid") || "no");
+    const second = originalPath ? ownTrack(originalPath) : null;
+    const occupied = secondId !== "no" && secondId !== "0" && secondId !== "" &&
+      (!second || secondId !== String(second.id));
+    sidebar.postMessage("lt:state", safeSidebarEnvelope({
+      enabled, connected: serviceReady, status: statusText(), state: state || {},
+      media: mediaPath ? mediaPath.split("/").pop() : "", position: currentPosition(),
+      duration: Number(mpv.getNumber("duration")) || 0,
+      settings: settings(), models: sidebarDescription.models || [],
+      cache: sidebarDescription.cache || [], languages: sidebarDescription.languages || {},
+      modelError: sidebarDescription.model_error || "",
+      operation: sidebarOperation, secondaryBusy: occupied || secondaryReplacedByUser
+    }));
+  } catch (error) { console.log("Не удалось обновить панель перевода"); }
+}
+
+function acceptDescription(result) {
+  const description = result.sidebar || result;
+  for (const key of ["settings", "models", "cache", "languages"]) {
+    if (description[key] !== undefined) sidebarDescription[key] = description[key];
+  }
+  if (description.models !== undefined) sidebarDescription.model_error = description.model_error || "";
+}
+
+function controlRequest(action, data, requestId) {
+  if (closed) return;
+  if (action === "enabled") {
+    setEnabled(Boolean(data.enabled));
+    return;
+  }
+  if (["describe", "settings", "cache_use", "cache_delete", "retry"].indexOf(action) < 0) return;
+  if (sidebarOperation.busy) {
+    if (sidebarQueue.length < 8) sidebarQueue.push({ action, data, requestId });
+    return;
+  }
+  if (action === "settings") {
+    const filtered = {};
+    for (const key of ["translation_model", "source_language", "target_language", "source_mode",
+      "bilingual", "wait_for_translation", "vad_mode", "batch_size", "glossary"]) {
+      if (Object.prototype.hasOwnProperty.call(data, key)) filtered[key] = data[key];
+    }
+    data = filtered;
+  }
+  sidebarOperation = { busy: true, error: "", requestId: String(requestId || ""), action };
+  const oldBilingual = Boolean(settings().bilingual);
+  const generationChanged = action === "settings" && ["translation_model", "source_language",
+    "target_language", "source_mode", "vad_mode", "batch_size", "glossary"].some(key =>
+    Object.prototype.hasOwnProperty.call(data, key) && JSON.stringify(data[key]) !== JSON.stringify(settings()[key]));
+  if (generationChanged || action === "cache_use") invalidateSource();
+  publishSidebar();
+  let auth;
+  try { auth = authToken(); } catch (error) {
+    sidebarOperation.busy = false;
+    sidebarOperation.error = String(error.message || error);
+    publishSidebar();
+    return;
+  }
+  serviceRequest(() => http.post(CONTROL_URL, {
+    headers: { "Authorization": "Bearer " + auth, "Content-Type": "application/x-www-form-urlencoded" },
+    data: { action, data: JSON.stringify(data || {}), client_id: clientId,
+      session_id: clientId + ":" + epoch, path: mediaPath, position: String(currentPosition()) }
+  })).then(response => {
+    const result = responseData(response);
+    if (result.error) throw new Error(String(result.error));
+    acceptDescription(result);
+    if (settings().wait_for_translation === false) releaseBuffer(true);
+    if (action === "cache_use") selectedCacheKey = String(data.key || "");
+    if (action === "cache_delete" && selectedCacheKey === String(data.key || "")) selectedCacheKey = "";
+    if (Boolean(settings().bilingual) && !oldBilingual) {
+      secondaryHiddenByUser = false;
+      secondaryReplacedByUser = false;
+    }
+    sourceSelectionKey = selectionKey(selectedSource());
+    retryAfter = 0;
+    urgentTick = true;
+  }).catch(error => {
+    sidebarOperation.error = String(error && error.message || "Не удалось выполнить действие. Попробуйте ещё раз.");
+  }).finally(() => {
+    sidebarOperation.busy = false;
+    publishSidebar();
+    if (sidebarQueue.length) {
+      const next = sidebarQueue.shift();
+      controlRequest(next.action, next.data, next.requestId);
+    } else tick();
+  });
+}
+
+function loadSidebar() {
+  if (!sidebar || sidebarLoaded || !core.window || !core.window.loaded) return;
+  try {
+    sidebar.loadFile("sidebar.html");
+    sidebarLoaded = true;
+    sidebar.onMessage("lt:ready", () => {
+      sidebarReady = true;
+      publishSidebar();
+      controlRequest("describe", {}, "initial");
+    });
+    sidebar.onMessage("lt:action", message => {
+      if (!message || typeof message !== "object" || Array.isArray(message)) return;
+      controlRequest(message.action, message.data || {}, message.requestId);
+    });
+  } catch (error) { console.log("Не удалось открыть панель перевода"); }
+}
 
 function osd(message) {
   try {
@@ -121,7 +410,19 @@ function checkBufferTimeout() {
 }
 
 function handleBuffering(result, requestPosition, requestSeekGeneration, applied) {
+  if (settings().wait_for_translation === false) {
+    releaseBuffer(true);
+    return;
+  }
   if (requestSeekGeneration !== seekGeneration || chunkAt(currentPosition()) !== chunkAt(requestPosition)) return;
+  if (result.read_only && result.current_ready === false) {
+    releaseBuffer(true);
+    if (!isBypassed(chunkAt(requestPosition))) {
+      bypassCurrentChunk();
+      osd("В этой сохранённой версии нет перевода для этого участка.");
+    }
+    return;
+  }
   if (!expectsRussian()) {
     releaseBuffer(true);
     return;
@@ -225,6 +526,7 @@ function onSubtitleIntentChanged(property) {
       wantSelect = false;
     } else if (track && subtitleIntent.sid === String(track.id)) followRussian = true;
   }
+  onSourceChanged();
   if (!bufferWait) return;
   // Initial native notifications may repeat the default "no subtitles" state.
   // Only a real user change cancels our first automatic track selection.
@@ -286,7 +588,10 @@ function applySubtitlesNow(result) {
 
   if (!track) {
     mpv.command("sub-add", [
-      path, shouldSelect ? "select" : "auto", TRACK_TITLE, "rus"
+      path, shouldSelect ? "select" : "auto",
+      settings().target_language && settings().target_language !== "ru"
+        ? languageName(settings().target_language) + " · Live Translation (локально)" : TRACK_TITLE,
+      settings().target_language || "rus"
     ]);
     track = ownTrack(path);
     changed = true;
@@ -344,6 +649,7 @@ function useRuntime(identity) {
       followRussian = false;
     }
     revision = -1;
+    originalRevision = -1;
     if (followRussian) wantSelect = true;
   }
   serviceRuntime = runtime;
@@ -369,6 +675,7 @@ function serviceRequest(request) {
 }
 
 function checkService() {
+  const requestSerial = ++requestSequence;
   busy = true;
   serviceRequest(() => http.get(HEALTH_URL, {})).then((response) => {
     const health = responseData(response);
@@ -387,6 +694,7 @@ function checkService() {
   }).catch(() => {
     retryService("Локальный сервис перевода пока недоступен. Подключусь автоматически…");
   }).finally(() => {
+    if (requestSerial !== requestSequence) return;
     busy = false;
     if (!closed) {
       updateMenu();
@@ -402,6 +710,9 @@ function statusText() {
   if (bufferWait) return "Готовлю перевод этого участка…";
   if (!state) return "Подключаю локальный перевод…";
   if (state.error) return "Ошибка локального перевода: " + state.error;
+  if (state.read_only) return state.current_ready === false
+    ? "В этой версии нет перевода для этого участка"
+    : "Сохранённая версия · только просмотр";
   if (state.done) return "Кэш всего видео готов · 100%";
   const percent = Math.max(0, Math.min(100, Math.floor(Number(state.prepared_percent || 0))));
   const buffered = Math.max(0, Math.floor(
@@ -412,7 +723,7 @@ function statusText() {
   }
   if (state.status === "loading") return "Загружаю локальные модели…";
   if (state.processing) return "Готовлю полный кэш видео: " + percent + "%…";
-  return "Готовлю русские субтитры…";
+  return "Готовлю перевод…";
 }
 
 function updateMenu() {
@@ -420,6 +731,7 @@ function updateMenu() {
   statusItem.title = statusText();
   startItem.enabled = Boolean(mediaPath);
   stopItem.enabled = enabled;
+  publishSidebar();
 }
 
 function authToken() {
@@ -449,9 +761,11 @@ function requestState(path, isEnabled, requestEpoch) {
     return;
   }
 
+  const requestSerial = ++requestSequence;
   busy = true;
   const position = isEnabled ? currentPosition() : 0;
   const requestSeekGeneration = seekGeneration;
+  const selection = selectedSource();
   // IINA 1.3.5's Just-based HTTP API sends `data` as form fields, not JSON.
   serviceRequest(() => http.post(SERVICE_URL, {
     headers: {
@@ -466,7 +780,9 @@ function requestState(path, isEnabled, requestEpoch) {
       native_russian_selected: String(Boolean(subtitlePath && ownTrack(subtitlePath) &&
         currentSid() === String(ownTrack(subtitlePath).id) && mpv.getFlag("sub-visibility"))),
       waiting_for_translation: String(Boolean(bufferWait)),
-      seek_generation: String(seekGeneration)
+      seek_generation: String(seekGeneration),
+      selection: JSON.stringify(selection), client_id: clientId,
+      session_id: clientId + ":" + requestEpoch, cache_key: selectedCacheKey
     }
   })).then((response) => {
     if (closed || !isEnabled || requestEpoch !== epoch || path !== mediaPath || !enabled) return;
@@ -480,6 +796,18 @@ function requestState(path, isEnabled, requestEpoch) {
       return;
     }
     useRuntime(result);
+    acceptDescription(result);
+    if (result.source_revision !== undefined) {
+      if (backendSourceRevision !== null && backendSourceRevision !== result.source_revision) {
+        clearGeneratedTracks();
+        if (followRussian) wantSelect = true;
+      }
+      backendSourceRevision = result.source_revision;
+    }
+    if (result.initializing && subtitlePath) {
+      clearGeneratedTracks();
+      if (followRussian) wantSelect = true;
+    }
     serviceFailures = 0;
     lastProblem = "";
     retryAfter = 0;
@@ -488,6 +816,7 @@ function requestState(path, isEnabled, requestEpoch) {
       console.log("Local subtitle service: " + result.error);
     }
     const applied = applySubtitles(result);
+    applyOriginal(result);
     handleBuffering(result, position, requestSeekGeneration, applied);
   }).catch((error) => {
     if (closed || requestEpoch !== epoch || !isEnabled || requestSeekGeneration !== seekGeneration) return;
@@ -498,6 +827,7 @@ function requestState(path, isEnabled, requestEpoch) {
       : "Локальный сервис перевода пока недоступен");
     console.log(lastProblem);
   }).finally(() => {
+    if (requestSerial !== requestSequence) return;
     busy = false;
     if (!closed) {
       updateMenu();
@@ -509,6 +839,12 @@ function requestState(path, isEnabled, requestEpoch) {
 function tick() {
   if (closed) return;
   checkBufferTimeout();
+  if (sidebarOperation.busy) return;
+  if (enabled && mediaPath) {
+    const next = selectionKey(selectedSource());
+    if (sourceSelectionKey && next !== sourceSelectionKey) invalidateSource();
+    sourceSelectionKey = next;
+  }
   if (busy || Date.now() < retryAfter) return;
   if (!serviceReady && (pendingStops.length || (enabled && mediaPath))) {
     checkService();
@@ -524,6 +860,9 @@ function tick() {
 
 function clearMedia() {
   releaseBuffer(false);
+  clearGeneratedTracks();
+  requestSequence += 1;
+  busy = false;
   bufferBypass = null;
   internalRefresh = null;
   seekGeneration += 1;
@@ -536,6 +875,12 @@ function clearMedia() {
   previousSid = "no";
   wantSelect = true;
   followRussian = true;
+  sourceSubtitleId = null;
+  sourceSelectionKey = "";
+  backendSourceRevision = null;
+  selectedCacheKey = "";
+  secondaryHiddenByUser = false;
+  secondaryReplacedByUser = false;
   subtitleIntent = null;
   lastProblem = "";
 }
@@ -551,6 +896,7 @@ function fileLoaded() {
     osd("Локальный перевод сейчас поддерживает видеофайлы на Mac");
   }
   rememberSubtitleIntent();
+  sourceSelectionKey = selectionKey(selectedSource());
   updateMenu();
   tick();
 }
@@ -569,7 +915,7 @@ function setEnabled(value, selectTrack) {
     retryAfter = 0;
     const track = subtitlePath ? ownTrack(subtitlePath) : null;
     if (track && wantSelect) selectOwnTrack(track);
-    osd(mediaPath ? "Локальный перевод на русский включён" : "Перевод включён — откройте видео");
+    osd(mediaPath ? "Локальный перевод включён" : "Перевод включён — откройте видео");
   } else {
     releaseBuffer(true);
     stopPath(mediaPath);
@@ -580,9 +926,9 @@ function setEnabled(value, selectTrack) {
   tick();
 }
 
-const rootItem = menu.item("Локальные русские субтитры", null, {});
+const rootItem = menu.item("Локальный перевод", null, {});
 const enabledItem = menu.item("Переводить автоматически", () => setEnabled(!enabled), { selected: enabled });
-const startItem = menu.item("Включить и показать русский перевод", () => setEnabled(true), {});
+const startItem = menu.item("Включить и показать перевод", () => setEnabled(true), {});
 const stopItem = menu.item("Остановить перевод", () => setEnabled(false), {});
 const statusItem = menu.item("Готовлю локальный перевод…", () => osd(statusText()), {});
 rootItem.addSubMenuItem(enabledItem);
@@ -590,6 +936,10 @@ rootItem.addSubMenuItem(startItem);
 rootItem.addSubMenuItem(stopItem);
 rootItem.addSubMenuItem(menu.separator());
 rootItem.addSubMenuItem(statusItem);
+rootItem.addSubMenuItem(menu.item("Настройки и кэш…", () => {
+  loadSidebar();
+  if (sidebar && sidebarLoaded) sidebar.show();
+}, {}));
 menu.addItem(rootItem);
 
 event.on("mpv.file-loaded", fileLoaded);
@@ -601,6 +951,12 @@ event.on("mpv.playback-restart", () => {
 event.on("mpv.pause.changed", onPauseChanged);
 event.on("mpv.sid.changed", () => onSubtitleIntentChanged("sid"));
 event.on("mpv.sub-visibility.changed", () => onSubtitleIntentChanged("sub-visibility"));
+event.on("mpv.secondary-sid.changed", () => onSecondaryChanged("secondary-sid"));
+event.on("mpv.secondary-sub-visibility.changed", () => onSecondaryChanged("secondary-sub-visibility"));
+for (const property of ["aid", "track-list", "sub-delay", "audio-delay"]) {
+  event.on("mpv." + property + ".changed", onSourceChanged);
+}
+event.on("iina.window-loaded", loadSidebar);
 event.on("mpv.end-file", () => {
   clearMedia();
   updateMenu();
@@ -615,6 +971,7 @@ event.on("mpv.shutdown", () => {
 
 const timer = setInterval(tick, 1000);
 updateMenu();
+loadSidebar();
 console.log("Native local subtitle bridge loaded (loopback only)");
 // Also attach when IINA reloads plugins while a video is already open.
 if (mpv.getString("path") && mpv.getNumber("duration") > 0) fileLoaded();

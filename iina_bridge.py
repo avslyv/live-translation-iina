@@ -37,6 +37,7 @@ from live_translation.deterministic import (
     seed_asr,
     whisper_decode_options,
 )
+from live_translation.iina_features import NativeFeatures, json_object
 from live_translation.local_http import local_urlopen
 from live_translation.media_cache import (
     fingerprint_file,
@@ -63,7 +64,7 @@ MLX_CACHE_BYTES = 128 * 1024 * 1024
 ASR_BATCH_SIZE = 4
 ASR_BATCH_BUFFER_SECONDS = 60.0
 PORT = RUNTIME.bridge_port
-MAX_BODY_BYTES = 16_384
+MAX_BODY_BYTES = 262_144
 WHISPER_MODEL = "mlx-community/whisper-large-v3-turbo"
 TRANSLATION_MODEL = "gemma4:12b"
 
@@ -246,7 +247,7 @@ class Media:
         )
 
 
-class Bridge:
+class Bridge(NativeFeatures):
     def __init__(self, cache_dir=None, *, start_worker=True, profile=None):
         self.runtime = load_runtime_config()
         self.cache_dir = (
@@ -279,6 +280,7 @@ class Bridge:
         self._translation_resident = False
         self._idle_since = None
         self.worker = None
+        self._features_init(start_worker)
         if start_worker:
             self.worker = threading.Thread(
                 target=self._worker, name="IINA local models", daemon=True
@@ -479,6 +481,9 @@ class Bridge:
         }
 
     def update(self, data):
+        feature_state = self._feature_update(data)
+        if feature_state is not None:
+            return feature_state
         enabled = boolean(data.get("enabled"), True)
         paused = boolean(data.get("paused"), False)
         position = float(data.get("position", 0))
@@ -585,6 +590,8 @@ class Bridge:
         return next(iter(self._missing_chunks(media)), None)
 
     def _missing_chunks(self, media):
+        if getattr(media, "read_only", False):
+            return []
         first = min(int(self.position // CHUNK_SECONDS), media.chunk_count - 1)
         last = min(media.chunk_count, first + math.ceil(LOOKAHEAD_SECONDS / CHUNK_SECONDS))
         nearby = [index for index in range(first, last) if str(index) not in media.chunks]
@@ -628,7 +635,9 @@ class Bridge:
                 "-t",
                 str(seconds),
                 "-map",
-                "0:a:0",
+                self.active.spec.audio_map
+                if self.active and hasattr(self.active, "spec")
+                else "0:a:0",
                 "-vn",
                 "-ac",
                 "1",
@@ -685,15 +694,17 @@ class Bridge:
         return mlx_whisper.transcribe(
             audio,
             path_or_hf_repo=self._whisper_path,
-            **whisper_decode_options(),
+            **whisper_decode_options(
+                getattr(self, "_asr_language", "en") if self._feature_session else "en"
+            ),
         )
 
     def _translate(self, source, history):
         if self._translator is None:
             self._translator = DeterministicTranslator(
                 model=self.translation_model,
-                target="ru",
-                source="en",
+                target=self.settings["target_language"] if self._feature_session else "ru",
+                source=self.settings["source_language"] if self._feature_session else "en",
                 url=self.runtime.ollama_url,
                 max_tokens=256,
                 temperature=0.0,
@@ -724,6 +735,9 @@ class Bridge:
             )
 
     def _save(self, media):
+        if hasattr(media, "spec"):
+            self._save_feature(media)
+            return
         phrases = media.phrases()
         # Save SRT first; the JSON commit is the marker that a revision is durable.
         if phrases or media.srt_path.exists():
@@ -757,6 +771,10 @@ class Bridge:
         )
 
     def _check_inputs(self, media):
+        if hasattr(media, "spec"):
+            media.spec.check_inputs()
+            self._verify_feature_artifacts(media)
+            return
         if source_signature(media.source) != media.signature:
             raise RuntimeError("Видеофайл изменился во время обработки; результат не сохранён")
         if (
@@ -789,6 +807,8 @@ class Bridge:
 
     def _prepare_speech(self, media, index, generation, *, keep_loaded=False):
         """Recognize a fixed chunk once, preserving valid work across seeks."""
+        if hasattr(media, "spec"):
+            return self._prepare_feature_speech(media, index, generation, keep_loaded=keep_loaded)
         if str(index) in media.recognized:
             return media.recognized[str(index)]
         if not self._still_active(media, generation):
@@ -828,6 +848,8 @@ class Bridge:
         return cues if self._still_active(media, generation) else None
 
     def _translate_speech(self, media, index, cues, generation):
+        if hasattr(media, "spec"):
+            return self._translate_feature_speech(media, index, cues, generation)
         if str(index) in media.chunks or not self._still_active(media, generation):
             return False
         # Keep requests byte-identical to the serial algorithm: same cue
@@ -881,6 +903,8 @@ class Bridge:
                 if cues is None:
                     return
                 prepared.append((index, cues))
+                if hasattr(media, "spec"):
+                    self._prepare_feature_context(media, index, generation)
         finally:
             # This handoff is unconditional on success, seek, or ASR failure.
             # Only compact cue dictionaries survive; audio is never queued.
@@ -969,6 +993,8 @@ class Bridge:
 
     def _worker(self):
         while True:
+            if self._initialize_pending():
+                continue
             with self.condition:
                 if self.closed:
                     break
@@ -1044,9 +1070,7 @@ def server_for(bridge, token, port=PORT, *, runtime_id=None):
 
         def do_GET(self):
             if self.path == "/health":
-                self.reply(
-                    200, {"status": "ok", "service": SERVICE_NAME, **identity}
-                )
+                self.reply(200, {"status": "ok", "service": SERVICE_NAME, **identity})
             elif self.path == "/status":
                 if not hmac.compare_digest(
                     self.headers.get("Authorization", ""), "Bearer " + token
@@ -1054,7 +1078,11 @@ def server_for(bridge, token, port=PORT, *, runtime_id=None):
                     self.reply(401, {"error": "Authentication required"})
                     return
                 with bridge.condition:
-                    state = bridge._response()
+                    state = (
+                        bridge._feature_response()
+                        if bridge._feature_session
+                        else bridge._response()
+                    )
                     state.update(
                         {
                             **identity,
@@ -1071,7 +1099,7 @@ def server_for(bridge, token, port=PORT, *, runtime_id=None):
                 self.reply(404, {"error": "Not found"})
 
         def do_POST(self):
-            if self.path != "/state":
+            if self.path not in {"/state", "/control"}:
                 self.reply(404, {"error": "Not found"})
                 return
             origin = self.headers.get("Origin")
@@ -1102,7 +1130,13 @@ def server_for(bridge, token, port=PORT, *, runtime_id=None):
                     return
                 if not isinstance(data, dict):
                     raise ValueError("The request must be an object")
-                self.reply(200, {**bridge.update(data), **identity})
+                if self.path == "/control":
+                    result = bridge.control(
+                        data.get("action"), json_object(data.get("data", {}), "data")
+                    )
+                else:
+                    result = bridge.update(data)
+                self.reply(200, {**result, **identity})
             except (
                 ValueError,
                 TypeError,
