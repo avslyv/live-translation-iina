@@ -7,6 +7,12 @@ const vm = require('node:vm');
 
 const source = fs.readFileSync(path.join(__dirname, '../iina-plugin/main.js'), 'utf8');
 
+function compatibleHealth(runtime = 'test-runtime-1', processId = 32100) {
+  return { status: 'ok', service: 'iina-local-translation', protocol: 1,
+    runtime_id: runtime, process_id: processId, version: '1.3.2',
+    capabilities: ['state_form', 'native_srt', 'auto_restart'] };
+}
+
 function playerHarness(options = {}) {
   const properties = {
     path: '/tmp/first-video.avi', duration: 600, 'time-pos': 0,
@@ -14,16 +20,21 @@ function playerHarness(options = {}) {
   };
   const listeners = new Map();
   const intervals = [];
-  const timeouts = [];
+  const timeouts = new Map();
+  let nextTimeout = 1;
   const commands = [];
   const writes = [];
   const requests = [];
+  const healthRequests = [];
   const preferences = new Map();
   const subtitles = [];
   const osd = [];
   const roots = [];
   let nextId = 1;
   let now = 1000;
+  let runtime = 'test-runtime-1';
+  let processId = 32100;
+  let healthFor = options.health || (() => compatibleHealth(runtime, processId));
   let responseFor = options.response || ((request) => ({
     path: '/tmp/first-ru.srt', revision: 1, current_ready: true,
     status: 'ready', buffered_until: 180, prepared_percent: 30, processing: false,
@@ -50,10 +61,16 @@ function playerHarness(options = {}) {
         set(name, value) { preferences.set(name, value); }, sync() {},
       },
       menu: { item, separator() { return {}; }, addItem(root) { roots.push(root); } },
-      http: { post(url, options) {
-        const request = { url, ...options.data };
+      http: { get(url) {
+        healthRequests.push(url);
+        return Promise.resolve(healthFor()).then(data => ({ data }));
+      }, post(url, requestOptions) {
+        const request = { url, ...requestOptions.data };
         requests.push(request);
-        return Promise.resolve(responseFor(request)).then(data => ({ data }));
+        const stamp = { protocol: 1, runtime_id: runtime, process_id: processId };
+        return Promise.resolve(responseFor(request)).then(data => ({
+          data: options.rawState ? data : { ...stamp, ...data },
+        }));
       } },
       mpv: {
         getString(name) { return String(properties[name] ?? ''); },
@@ -82,21 +99,32 @@ function playerHarness(options = {}) {
     },
     setInterval(action) { intervals.push(action); return intervals.length; },
     clearInterval() {},
-    setTimeout(action) { timeouts.push(action); return timeouts.length; },
+    setTimeout(action, delay = 0) {
+      const id = nextTimeout++;
+      timeouts.set(id, { action, at: now + delay });
+      return id;
+    },
+    clearTimeout(id) { timeouts.delete(id); },
     Date: { now() { return now; } },
   });
   vm.runInContext(source, context);
   async function settle() {
     for (let round = 0; round < 10; round++) {
       await new Promise(setImmediate);
-      if (!timeouts.length) return;
-      while (timeouts.length) timeouts.shift()();
+      const ready = Array.from(timeouts).filter(([, task]) => task.at <= now);
+      if (!ready.length) return;
+      for (const [id, task] of ready) {
+        if (timeouts.delete(id)) task.action();
+      }
     }
     throw new Error('Plugin did not settle');
   }
   return {
-    properties, subtitles, commands, writes, requests, osd, roots, context,
+    properties, subtitles, commands, writes, requests, healthRequests, osd, roots, context,
     setResponse(fn) { responseFor = fn; },
+    setHealth(fn) { healthFor = fn; },
+    setRuntime(value) { runtime = value; },
+    setProcessId(value) { processId = value; },
     emit,
     advance(ms) { now += ms; },
     userSet(name, value) { properties[name] = value; emit(`mpv.${name}.changed`); },
@@ -407,3 +435,228 @@ test('initial unchanged native subtitle notifications preserve automatic start',
   assert.equal(h.properties.sid, String(h.subtitles[0].id));
   assert.equal(h.properties['sub-visibility'], true);
 });
+
+for (const [name, health] of [
+  ['legacy backend', { status: 'ok', service: 'iina-local-translation', protocol: 1 }],
+  ['missing form support', { ...compatibleHealth(), capabilities: ['native_srt'] }],
+  ['missing native subtitles', { ...compatibleHealth(), capabilities: ['state_form'] }],
+  ['missing runtime', { ...compatibleHealth(), runtime_id: '' }],
+  ['missing process id', { ...compatibleHealth(), process_id: undefined }],
+  ['invalid process id', { ...compatibleHealth(), process_id: 0 }],
+  ['non-numeric process id', { ...compatibleHealth(), process_id: '32100' }],
+  ['missing version', { ...compatibleHealth(), version: undefined }],
+  ['unknown protocol', { ...compatibleHealth(), protocol: 2 }],
+]) {
+  test(`${name} is polled without posting a state form to an incompatible service`, async () => {
+    const h = playerHarness({ health: () => health });
+    await h.settle();
+    assert.equal(h.requests.length, 0);
+    assert.equal(h.commands.length, 0);
+    assert.equal(h.healthRequests[0], 'http://127.0.0.1:18743/health');
+    assert.match(h.roots[0].children[4].title, /Служба обновляется/);
+    await h.tick();
+    assert.equal(h.healthRequests.length, 1, 'do not poll on every player event');
+    h.setHealth(() => compatibleHealth());
+    h.advance(3000);
+    await h.tick();
+    assert.equal(h.requests.length, 1);
+    assert.equal(h.properties.sid, String(h.subtitles[0].id));
+    assert.equal(h.properties['sub-visibility'], true);
+  });
+}
+
+test('incompatible service retries have a capped delay instead of a request loop', async () => {
+  const h = playerHarness({ health: () => ({}) });
+  await h.settle();
+  for (const delay of [3000, 5000, 10000, 15000, 15000]) {
+    const count = h.healthRequests.length;
+    h.advance(delay - 1);
+    await h.tick();
+    assert.equal(h.healthRequests.length, count);
+    h.advance(1);
+    await h.tick();
+    assert.equal(h.healthRequests.length, count + 1);
+  }
+  assert.equal(h.requests.length, 0);
+});
+
+test('a state response missing the negotiated protocol is ignored until health recovers', async () => {
+  const h = playerHarness({ rawState: true, response: () => ready() });
+  await h.settle();
+  assert.equal(h.commands.length, 0);
+  assert.match(h.roots[0].children[4].title, /Служба обновляется/);
+  h.setResponse(() => ({ ...ready(), protocol: 1, runtime_id: 'test-runtime-1', process_id: 32100 }));
+  h.advance(3000);
+  await h.tick();
+  assert.equal(h.healthRequests.length, 2);
+  assert.equal(h.properties.sid, String(h.subtitles[0].id));
+});
+
+test('a new runtime reloads the cached native track even when its path and revision match', async () => {
+  const h = playerHarness({ response: () => ready(), nativeEvents: true });
+  await h.settle();
+  const oldSid = h.properties.sid;
+  h.setRuntime('updated-runtime-2');
+  await h.tick();
+  assert.ok(h.commands.some(([name]) => name === 'sub-reload'));
+  assert.notEqual(h.properties.sid, oldSid);
+  assert.equal(h.properties.sid, String(h.subtitles[0].id));
+  assert.equal(h.properties['sub-visibility'], true);
+  assert.equal(h.writes.some(([name]) => name === 'pause'), false);
+});
+
+test('a same-code worker restart reloads and selects the same cached native track', async () => {
+  const h = playerHarness({ response: () => ready(), nativeEvents: true });
+  await h.settle();
+  const oldSid = h.properties.sid;
+  h.setProcessId(32101);
+  await h.tick();
+  assert.ok(h.commands.some(([name]) => name === 'sub-reload'));
+  assert.notEqual(h.properties.sid, oldSid);
+  assert.equal(h.properties.sid, String(h.subtitles[0].id));
+  assert.equal(h.properties['sub-visibility'], true);
+});
+
+test('a dropped connection rechecks health and attaches an already cached Russian track', async () => {
+  const h = playerHarness({ response: () => ready(), nativeEvents: true });
+  await h.settle();
+  h.setResponse(() => Promise.reject(new Error('worker restarting')));
+  await h.tick();
+  assert.match(h.roots[0].children[4].title, /недоступен/);
+  h.subtitles.splice(0);
+  h.userSet('sid', 'no');
+  h.setRuntime('restarted-runtime-2');
+  h.setResponse(() => ready());
+  h.advance(3000);
+  await h.tick();
+  assert.equal(h.healthRequests.length, 2);
+  assert.equal(h.properties.sid, String(h.subtitles[0].id));
+  assert.equal(h.properties['sub-visibility'], true);
+  assert.equal(h.writes.some(([name]) => name === 'pause'), false);
+});
+
+for (const choice of ['hide', 'other track']) {
+  test(`worker restart preserves the user's ${choice} choice and manual pause`, async () => {
+    const h = playerHarness({ response: () => ready(), nativeEvents: true });
+    await h.settle();
+    h.userSet('pause', true);
+    if (choice === 'hide') h.userSet('sub-visibility', false);
+    else {
+      h.subtitles.push({ type: 'sub', id: 99, 'external-filename': '/tmp/user.srt' });
+      h.userSet('sid', '99');
+    }
+    const expectedSid = h.properties.sid;
+    const expectedVisibility = h.properties['sub-visibility'];
+    h.setRuntime('updated-runtime-2');
+    await h.tick();
+    assert.equal(h.properties.pause, true);
+    assert.equal(h.properties['sub-visibility'], expectedVisibility);
+    if (choice === 'other track') assert.equal(h.properties.sid, expectedSid);
+    assert.equal(h.writes.some(([name]) => name === 'pause'), false);
+  });
+}
+
+test('a same-code worker restart preserves explicit hide and manual pause', async () => {
+  const h = playerHarness({ response: () => ready(), nativeEvents: true });
+  await h.settle();
+  h.userSet('sub-visibility', false);
+  h.userSet('pause', true);
+  h.setProcessId(32101);
+  await h.tick();
+  assert.ok(h.commands.some(([name]) => name === 'sub-reload'));
+  assert.equal(h.properties['sub-visibility'], false);
+  assert.equal(h.properties.pause, true);
+  assert.equal(h.writes.some(([name]) => name === 'pause'), false);
+});
+
+test('a missing native track is reattached from cache while Russian intent remains automatic', async () => {
+  const h = playerHarness({ response: () => ready(), nativeEvents: true });
+  await h.settle();
+  h.subtitles.splice(0);
+  h.userSet('sid', 'no');
+  await h.tick();
+  assert.equal(h.commands.filter(([name]) => name === 'sub-add').length, 2);
+  assert.equal(h.properties.sid, String(h.subtitles[0].id));
+  assert.equal(h.properties['sub-visibility'], true);
+});
+
+test('an explicit hide remains hidden even if the native track disappears across restart', async () => {
+  const h = playerHarness({ response: () => ready(), nativeEvents: true });
+  await h.settle();
+  h.userSet('sub-visibility', false);
+  h.subtitles.splice(0);
+  h.userSet('sid', 'no');
+  h.setRuntime('updated-runtime-2');
+  await h.tick();
+  assert.equal(h.properties.sid, 'no');
+  assert.equal(h.properties['sub-visibility'], false);
+  assert.equal(h.commands.at(-1)[1][1], 'auto');
+});
+
+test('stopping while the service updates never starts translation when it reconnects', async () => {
+  const h = playerHarness({ health: () => ({}) });
+  await h.settle();
+  h.roots[0].children[2].action();
+  h.setHealth(() => compatibleHealth('updated-runtime-2'));
+  h.advance(3000);
+  await h.tick();
+  assert.equal(h.requests.length, 1);
+  assert.equal(h.requests[0].enabled, 'false');
+  assert.equal(h.commands.length, 0);
+  assert.equal(h.roots[0].children[0].selected, false);
+});
+
+test('a hung health request times out and the next handshake starts translation', async () => {
+  const pending = deferred();
+  const h = playerHarness({ health: () => pending.promise });
+  await h.settle();
+  assert.equal(h.requests.length, 0);
+  h.advance(10000);
+  await h.tick();
+  assert.match(h.roots[0].children[4].title, /недоступен/);
+  h.setHealth(() => compatibleHealth());
+  h.advance(3000);
+  await h.tick();
+  assert.equal(h.healthRequests.length, 2);
+  assert.equal(h.properties.sid, String(h.subtitles[0].id));
+  pending.resolve({});
+  await h.settle();
+  assert.doesNotMatch(h.roots[0].children[4].title, /обновляется|недоступен/);
+});
+
+test('a hung state request recovers and its late response cannot replace the native track', async () => {
+  const h = playerHarness({ response: () => ready(), nativeEvents: true });
+  await h.settle();
+  const pending = deferred();
+  h.setResponse(() => pending.promise);
+  await h.tick();
+  h.advance(10000);
+  await h.tick();
+  assert.match(h.roots[0].children[4].title, /недоступен/);
+  h.setRuntime('updated-runtime-2');
+  h.setResponse(() => ready());
+  h.advance(3000);
+  await h.tick();
+  const sid = h.properties.sid;
+  const count = h.commands.length;
+  pending.resolve({ ...ready(99), path: '/tmp/stale-ru.srt' });
+  await h.settle();
+  assert.equal(h.commands.length, count);
+  assert.equal(h.properties.sid, sid);
+  assert.equal(h.subtitles[0]['external-filename'], '/tmp/first-ru.srt');
+});
+
+for (const method of ['health', 'state']) {
+  test(`a synchronous ${method} HTTP exception releases busy state and reconnects`, async () => {
+    const fail = () => { throw new Error('native HTTP setup failed'); };
+    const h = playerHarness(method === 'health' ? { health: fail } : { response: fail });
+    await h.settle();
+    assert.match(h.roots[0].children[4].title, /недоступен/);
+    h.setHealth(() => compatibleHealth());
+    h.setResponse(() => ready());
+    h.advance(3000);
+    await h.tick();
+    assert.equal(h.properties.sid, String(h.subtitles[0].id));
+    assert.equal(h.properties['sub-visibility'], true);
+  });
+}

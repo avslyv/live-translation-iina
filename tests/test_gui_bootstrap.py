@@ -11,10 +11,61 @@ from unittest import mock
 import pytest
 
 from installer import bootstrap
+from live_translation.runtime_lifecycle import begin_runtime_update, runtime_revision
+from live_translation.service_contract import SERVICE_NAME, service_identity
 
 
 def events(capsys):
     return [json.loads(line) for line in capsys.readouterr().out.splitlines() if line]
+
+
+def runtime_tree(project):
+    (project / "live_translation").mkdir(parents=True, exist_ok=True)
+    (project / "iina_bridge.py").write_text("# previous worker fixture\n")
+    (project / "live_translation/__init__.py").write_text("")
+    (project / "requirements-iina.txt").write_text("# previous dependencies fixture\n")
+    return project
+
+
+@pytest.mark.parametrize("kind", ["legacy", "runtime", "capabilities", "process"])
+def test_gui_service_readiness_rejects_stale_healthy_listener(tmp_path, monkeypatch, kind):
+    project = runtime_tree(tmp_path / "project")
+    monkeypatch.setenv("LT_BRIDGE_PORT", "19143")
+    body = {
+        "status": "ok",
+        "service": SERVICE_NAME,
+        **service_identity(runtime_revision(project)),
+    }
+    if kind == "legacy":
+        body = {"status": "ok"}
+    elif kind == "runtime":
+        body["runtime_id"] = "0" * 64
+    elif kind == "capabilities":
+        body["capabilities"] = ["state_form", "native_srt"]
+    else:
+        body.pop("process_id", None)
+    with mock.patch.object(
+        bootstrap, "local_urlopen", return_value=io.BytesIO(json.dumps(body).encode())
+    ) as request:
+        assert not bootstrap.service_ready(project)
+    request.assert_called_once_with("http://127.0.0.1:19143/health", timeout=1)
+
+
+def test_gui_service_readiness_requires_complete_matching_runtime(tmp_path):
+    project = runtime_tree(tmp_path / "project")
+    body = {
+        "status": "ok",
+        "service": SERVICE_NAME,
+        **service_identity(runtime_revision(project)),
+    }
+    with mock.patch.object(
+        bootstrap, "local_urlopen", return_value=io.BytesIO(json.dumps(body).encode())
+    ):
+        assert bootstrap.service_ready(project)
+    begin_runtime_update(project)
+    with mock.patch.object(bootstrap, "local_urlopen") as request:
+        assert not bootstrap.service_ready(project)
+    request.assert_not_called()
 
 
 def speech_cache(tmp_path: Path, monkeypatch, weight_name="weights.safetensors"):
@@ -261,9 +312,17 @@ def test_failed_venv_creation_restores_previous_runtime_even_when_target_is_miss
     (environment / "bin").mkdir(parents=True)
     (environment / "bin/python").write_text("previous interpreter fixture")
     (environment / "keep.txt").write_text("working previous environment")
+    runtime_tree(support / "project")
     agent = tmp_path / "Library/LaunchAgents" / (bootstrap.BRIDGE_LABEL + ".plist")
     agent.parent.mkdir(parents=True)
     agent.write_bytes(b"previous agent fixture")
+
+    def fail_venv(*args, **kwargs):
+        marker = support / "project/runtime-revision.json"
+        assert json.loads(marker.read_text())["state"] == "updating"
+        assert not environment.exists()
+        raise RuntimeError("venv creation fixture failed")
+
     with (
         mock.patch.object(
             bootstrap.shutil, "disk_usage", return_value=mock.Mock(free=100 * 1024**3)
@@ -276,15 +335,19 @@ def test_failed_venv_creation_restores_previous_runtime_even_when_target_is_miss
         mock.patch.object(bootstrap, "ensure_ollama_server"),
         mock.patch.object(bootstrap.subprocess, "run", return_value=mock.Mock(returncode=0)),
         mock.patch.object(bootstrap, "start_agent") as start_agent,
-        mock.patch.object(
-            bootstrap, "run", side_effect=RuntimeError("venv creation fixture failed")
-        ) as run,
+        mock.patch.object(bootstrap, "run", side_effect=fail_venv) as run,
         pytest.raises(RuntimeError, match="venv creation fixture failed"),
     ):
         bootstrap.install(bootstrap.Reporter())
     assert run.call_args.args[0][1:3] == ["-m", "venv"]
     assert (environment / "keep.txt").read_text() == "working previous environment"
     assert (environment / "bin/python").read_text() == "previous interpreter fixture"
+    marker = json.loads((support / "project/runtime-revision.json").read_text())
+    assert marker == {
+        "schema": 1,
+        "state": "ready",
+        "revision": runtime_revision(support / "project"),
+    }
     start_agent.assert_called_once_with(agent, bootstrap.BRIDGE_LABEL)
 
 

@@ -9,6 +9,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from live_translation import service_control
+from live_translation.runtime_lifecycle import runtime_revision
+
 SPEC = importlib.util.spec_from_file_location(
     "install_iina", Path(__file__).resolve().parents[1] / "tools/install_iina.py"
 )
@@ -87,6 +90,11 @@ class InstallerTests(unittest.TestCase):
             python_inode = python.stat().st_ino
             marker = project / ".venv/installed-dependencies"
             marker.write_text("already installed")
+            token_file = support / "iina-token"
+            token_file.write_text("existing-scoped-token-preserved-on-update\n")
+            model = home / ".cache/huggingface/model-fixture"
+            model.parent.mkdir(parents=True)
+            model.write_text("existing local weights")
             self.assertFalse((project / "iina_bridge.py").exists())
             iina = root / "IINA.app"
             contents = iina / "Contents"
@@ -95,6 +103,19 @@ class InstallerTests(unittest.TestCase):
             (contents / "Info.plist").write_bytes(
                 plistlib.dumps({"CFBundleShortVersionString": "1.5.1"})
             )
+            original_copy = installer.copy_runtime
+
+            def copy_with_marker(source, destination, **kwargs):
+                if destination == project:
+                    state = json.loads((project / "runtime-revision.json").read_text())
+                    self.assertEqual(state["state"], "updating")
+                original_copy(source, destination, **kwargs)
+
+            def start_after_commit(*args, **kwargs):
+                state = json.loads((project / "runtime-revision.json").read_text())
+                self.assertEqual(state["state"], "ready")
+                self.assertEqual(state["revision"], kwargs["expected_runtime_id"])
+
             with (
                 mock.patch.dict(installer.os.environ, {"HOME": str(home)}, clear=True),
                 mock.patch.object(installer.platform, "system", return_value="Darwin"),
@@ -105,16 +126,19 @@ class InstallerTests(unittest.TestCase):
                 mock.patch.object(installer, "command", return_value="/private/ffmpeg"),
                 mock.patch.object(installer, "optional_command", return_value=None),
                 mock.patch.object(installer.shutil, "which", return_value=None),
+                mock.patch.object(installer, "copy_runtime", side_effect=copy_with_marker),
                 mock.patch.object(installer, "run") as run,
-                mock.patch.object(installer, "start_agent") as start,
+                mock.patch.object(
+                    installer, "ensure_service", side_effect=start_after_commit
+                ) as start,
                 mock.patch("builtins.print"),
             ):
-                self.assertEqual(
-                    installer.main(["--iina", str(iina), "--no-launcher", "--start"]), 0
-                )
+                self.assertEqual(installer.main(["--iina", str(iina), "--no-launcher"]), 0)
             self.assertEqual(python.read_text(), "prepared private Python environment")
             self.assertEqual(python.stat().st_ino, python_inode)
             self.assertEqual(marker.read_text(), "already installed")
+            self.assertEqual(token_file.read_text(), "existing-scoped-token-preserved-on-update\n")
+            self.assertEqual(model.read_text(), "existing local weights")
             self.assertEqual(
                 (project / "iina_bridge.py").read_bytes(),
                 (installer.SOURCE / "iina_bridge.py").read_bytes(),
@@ -126,7 +150,9 @@ class InstallerTests(unittest.TestCase):
             plugin = support / "iina-plugin"
             plugin_info = json.loads((plugin / "Info.json").read_text())
             self.assertIn("file-system", plugin_info["permissions"])
-            self.assertIn("function authToken() { return token; }", (plugin / "main.js").read_text())
+            self.assertIn(
+                "function authToken() { return token; }", (plugin / "main.js").read_text()
+            )
             plugin_link = (
                 home
                 / "Library/Application Support/com.colliderli.iina/plugins/iina-plugin.iinaplugin-dev"
@@ -138,7 +164,15 @@ class InstallerTests(unittest.TestCase):
                 service["ProgramArguments"], [str(python), str(project / "iina_bridge.py")]
             )
             self.assertEqual(service["EnvironmentVariables"]["HOME"], str(home))
-            start.assert_called_once_with(agent)
+            start.assert_called_once_with(
+                project,
+                config=mock.ANY,
+                expected_runtime_id=runtime_revision(project),
+                force_restart=True,
+            )
+            self.assertEqual(
+                json.loads((project / "runtime-revision.json").read_text())["state"], "ready"
+            )
             self.assertFalse(
                 any("pip" in call.args or "venv" in call.args for call in run.call_args_list)
             )
@@ -248,8 +282,11 @@ class InstallerTests(unittest.TestCase):
                     root / "Backup",
                 )
             script = (app / "Contents/MacOS/LiveTranslationIINA").read_text()
-            self.assertIn("local.live-translation.clean-test.iina", script)
-            self.assertNotIn('/local.live-translation.iina"', script)
+            self.assertIn("export LT_INSTANCE_ID=local.live-translation.clean-test", script)
+            self.assertIn("-m live_translation.service_control --ensure", script)
+            self.assertIn("/.venv/bin/python'", script)
+            self.assertNotIn("launchctl", script)
+            self.assertLess(script.index("--ensure"), script.index("exec /usr/bin/open"))
             self.assertIn("export LT_BRIDGE_PORT=18784", script)
             self.assertIn("export LT_OLLAMA_PORT=11484", script)
             self.assertIn("export CFFIXED_USER_HOME=", script)
@@ -279,11 +316,16 @@ class InstallerTests(unittest.TestCase):
                 mock.patch.object(installer, "command", return_value="/private/ffmpeg"),
                 mock.patch.object(installer, "optional_command", return_value=None),
                 mock.patch.object(installer, "copy_runtime"),
+                mock.patch.object(installer, "finish_runtime_update"),
+                mock.patch.object(installer, "ensure_service") as ensure,
                 mock.patch.object(installer, "atomic_write"),
                 mock.patch.object(installer, "run") as run,
                 mock.patch("builtins.print"),
             ):
-                self.assertEqual(installer.main(["--iina", str(iina), "--no-launcher"]), 0)
+                self.assertEqual(
+                    installer.main(["--iina", str(iina), "--no-launcher", "--no-start"]), 0
+                )
+            ensure.assert_not_called()
             writes = [
                 call.args
                 for call in run.call_args_list
@@ -327,9 +369,9 @@ class InstallerTests(unittest.TestCase):
         )
         with (
             mock.patch.object(
-                installer.subprocess, "run", side_effect=[ok, ok, busy, ok]
+                service_control.subprocess, "run", side_effect=[ok, ok, busy, ok]
             ) as process,
-            mock.patch.object(installer.time, "sleep") as sleep,
+            mock.patch.object(service_control.time, "sleep") as sleep,
         ):
             installer.start_agent(Path("/example/agent.plist"), "test.agent", attempts=3)
         commands = [list(call.args[0]) for call in process.call_args_list]
@@ -344,9 +386,9 @@ class InstallerTests(unittest.TestCase):
         failed = subprocess.CompletedProcess([], 5, stdout="", stderr="invalid job fixture")
         with (
             mock.patch.object(
-                installer.subprocess, "run", side_effect=[ok, ok, failed, failed, failed]
+                service_control.subprocess, "run", side_effect=[ok, ok, failed, failed, failed]
             ) as process,
-            mock.patch.object(installer.time, "sleep") as sleep,
+            mock.patch.object(service_control.time, "sleep") as sleep,
             mock.patch.object(installer.sys, "stderr"),
             self.assertRaises(subprocess.CalledProcessError) as raised,
         ):
@@ -360,8 +402,8 @@ class InstallerTests(unittest.TestCase):
         ok = subprocess.CompletedProcess([], 0, stdout="", stderr="")
         failed = subprocess.CompletedProcess([], 125, stdout="", stderr="invalid domain fixture")
         with (
-            mock.patch.object(installer.subprocess, "run", side_effect=[ok, ok, failed]),
-            mock.patch.object(installer.time, "sleep") as sleep,
+            mock.patch.object(service_control.subprocess, "run", side_effect=[ok, ok, failed]),
+            mock.patch.object(service_control.time, "sleep") as sleep,
             mock.patch.object(installer.sys, "stderr"),
             self.assertRaises(subprocess.CalledProcessError) as raised,
         ):
@@ -373,7 +415,7 @@ class InstallerTests(unittest.TestCase):
         ok = subprocess.CompletedProcess([], 0, stdout="", stderr="")
         with (
             mock.patch.dict(installer.os.environ, {"LT_INSTANCE_ID": "local.clean-test"}),
-            mock.patch.object(installer.subprocess, "run", return_value=ok) as process,
+            mock.patch.object(service_control.subprocess, "run", return_value=ok) as process,
         ):
             installer.start_agent(Path("/example/agent.plist"))
         commands = [list(call.args[0]) for call in process.call_args_list]
@@ -394,7 +436,8 @@ class InstallerTests(unittest.TestCase):
         args = installer.parser().parse_args([])
         self.assertFalse(args.install_dependencies)
         self.assertFalse(args.download_models)
-        self.assertFalse(args.start)
+        self.assertTrue(args.start)
+        self.assertFalse(installer.parser().parse_args(["--no-start"]).start)
 
     def test_existing_token_is_preserved_without_writing(self):
         with tempfile.TemporaryDirectory() as temporary:

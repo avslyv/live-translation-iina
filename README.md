@@ -29,6 +29,7 @@ IINA video ──► FFmpeg ──► Whisper / MLX ──► Gemma / Ollama
 
 - **Automatic:** opening a local video starts preparation and selects the Russian track.
 - **Seek aware:** an uncached position becomes the next job. The player waits there and resumes when its subtitles are ready.
+- **Update recovery:** the service restarts after updates and IINA reconnects automatically, preserving your pause and subtitle choices.
 - **Persistent:** completed chunks survive restarts. Identical video content reuses the cache after a rename or move.
 - **Reproducible:** fixed decoding settings, seed, model identities, and prompts; cached text is reused unchanged.
 - **Native:** IINA renders a regular SRT track using its own font, size, position, visibility, and timing controls.

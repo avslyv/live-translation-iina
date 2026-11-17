@@ -2,10 +2,12 @@
 const { console, core, event, file, http, menu, mpv, preferences } = iina;
 
 const SERVICE_URL = "http://127.0.0.1:18743/state";
+const HEALTH_URL = SERVICE_URL.replace(/\/state$/, "/health");
 const TOKEN_PATH = "~/Library/Application Support/LiveTranslate/iina-token";
 const TRACK_TITLE = "Русский · Live Translation (локально)";
 const CHUNK_SECONDS = 30;
 const BUFFER_TIMEOUT_MS = 45000;
+const REQUEST_TIMEOUT_MS = 10000;
 
 let enabled = preferences.get("enabled") !== false;
 let mediaPath = "";
@@ -29,6 +31,10 @@ let bufferBypass = null;
 let internalRefresh = null;
 let changingSubtitles = false;
 let subtitleIntent = null;
+let followRussian = true;
+let serviceReady = false;
+let serviceRuntime = "";
+let serviceFailures = 0;
 
 function osd(message) {
   try {
@@ -201,7 +207,25 @@ function changeSubtitles(action) {
 function onSubtitleIntentChanged(property) {
   const previous = subtitleIntent;
   rememberSubtitleIntent();
-  if (changingSubtitles || !bufferWait) return;
+  if (changingSubtitles) return;
+  const changed = previous && (
+    (property === "sid" && previous.sid !== subtitleIntent.sid) ||
+    (property === "sub-visibility" && previous.visible !== subtitleIntent.visible)
+  );
+  const track = subtitlePath ? ownTrack(subtitlePath) : null;
+  // A disappearing generated track can reset sid during a native reload.
+  // Keep the last intent so the next response can attach that track again.
+  if (changed && property === "sid" && (track || subtitleIntent.sid !== "no")) {
+    followRussian = Boolean(track && subtitleIntent.sid === String(track.id) && subtitleIntent.visible);
+    if (!followRussian) wantSelect = false;
+  }
+  if (changed && property === "sub-visibility") {
+    if (!subtitleIntent.visible) {
+      followRussian = false;
+      wantSelect = false;
+    } else if (track && subtitleIntent.sid === String(track.id)) followRussian = true;
+  }
+  if (!bufferWait) return;
   // Initial native notifications may repeat the default "no subtitles" state.
   // Only a real user change cancels our first automatic track selection.
   if (wantSelect && previous && (
@@ -228,6 +252,7 @@ function selectOwnTrack(track) {
     mpv.set("sid", String(track.id));
     mpv.set("sub-visibility", true);
     wantSelect = false;
+    followRussian = true;
   });
 }
 
@@ -249,6 +274,7 @@ function applySubtitlesNow(result) {
   const sidBefore = currentSid();
   const previousTrack = subtitlePath && subtitlePath !== path ? ownTrack(subtitlePath) : null;
   let track = ownTrack(path);
+  if (!track && followRussian) wantSelect = true;
   const previousWasSelected = previousTrack && sidBefore === String(previousTrack.id);
   const currentWasSelected = track && sidBefore === String(track.id);
   const shouldSelect = wantSelect || previousWasSelected || currentWasSelected;
@@ -292,6 +318,81 @@ function applySubtitlesNow(result) {
     mpv.command("seek", ["0", "relative+exact"]);
   }
   return true;
+}
+
+function responseData(response) {
+  const data = response.data;
+  const result = data && typeof data === "object" ? data : JSON.parse(response.text || data);
+  if (!result || typeof result !== "object" || Array.isArray(result)) {
+    throw new Error("Invalid local service response");
+  }
+  return result;
+}
+
+function hasRuntime(result) {
+  return result.protocol === 1 && typeof result.runtime_id === "string" &&
+    result.runtime_id.length > 0 && Number.isInteger(result.process_id) && result.process_id > 0;
+}
+
+function useRuntime(identity) {
+  const runtime = identity.runtime_id + ":" + identity.process_id;
+  if (serviceRuntime && serviceRuntime !== runtime) {
+    const track = subtitlePath ? ownTrack(subtitlePath) : null;
+    // Poll the current native choice too: native change notifications can arrive
+    // after an HTTP response, and an update must never undo the user's choice.
+    if (track && (currentSid() !== String(track.id) || !mpv.getFlag("sub-visibility"))) {
+      followRussian = false;
+    }
+    revision = -1;
+    if (followRussian) wantSelect = true;
+  }
+  serviceRuntime = runtime;
+}
+
+function retryService(message) {
+  serviceReady = false;
+  serviceFailures += 1;
+  const delays = [3000, 5000, 10000, 15000];
+  retryAfter = Date.now() + delays[Math.min(serviceFailures - 1, delays.length - 1)];
+  lastProblem = message;
+  bufferFailure(message);
+}
+
+function serviceRequest(request) {
+  let timer;
+  const timeout = new Promise((resolve, reject) => {
+    timer = setTimeout(() => reject(new Error("Local service request timed out")), REQUEST_TIMEOUT_MS);
+  });
+  // A late response belongs to the timed-out request and cannot change tracks
+  // or overwrite the recovered connection's state.
+  return Promise.race([Promise.resolve().then(request), timeout]).finally(() => clearTimeout(timer));
+}
+
+function checkService() {
+  busy = true;
+  serviceRequest(() => http.get(HEALTH_URL, {})).then((response) => {
+    const health = responseData(response);
+    if (health.status !== "ok" || health.service !== "iina-local-translation" ||
+        !hasRuntime(health) || typeof health.version !== "string" || !health.version ||
+        !Array.isArray(health.capabilities) ||
+        !["state_form", "native_srt"].every(name => health.capabilities.indexOf(name) >= 0)) {
+      retryService("Служба обновляется… Подключусь автоматически.");
+      return;
+    }
+    useRuntime(health);
+    serviceReady = true;
+    serviceFailures = 0;
+    retryAfter = 0;
+    lastProblem = "";
+  }).catch(() => {
+    retryService("Локальный сервис перевода пока недоступен. Подключусь автоматически…");
+  }).finally(() => {
+    busy = false;
+    if (!closed) {
+      updateMenu();
+      if (serviceReady && (pendingStops.length || (enabled && mediaPath))) setTimeout(tick, 0);
+    }
+  });
 }
 
 function statusText() {
@@ -352,7 +453,7 @@ function requestState(path, isEnabled, requestEpoch) {
   const position = isEnabled ? currentPosition() : 0;
   const requestSeekGeneration = seekGeneration;
   // IINA 1.3.5's Just-based HTTP API sends `data` as form fields, not JSON.
-  http.post(SERVICE_URL, {
+  serviceRequest(() => http.post(SERVICE_URL, {
     headers: {
       "Authorization": "Bearer " + auth,
       "Content-Type": "application/x-www-form-urlencoded"
@@ -367,15 +468,21 @@ function requestState(path, isEnabled, requestEpoch) {
       waiting_for_translation: String(Boolean(bufferWait)),
       seek_generation: String(seekGeneration)
     }
-  }).then((response) => {
-    lastProblem = "";
-    retryAfter = 0;
+  })).then((response) => {
     if (closed || !isEnabled || requestEpoch !== epoch || path !== mediaPath || !enabled) return;
     if (requestSeekGeneration !== seekGeneration) {
       urgentTick = true;
       return;
     }
-    const result = response.data || JSON.parse(response.text);
+    const result = responseData(response);
+    if (!hasRuntime(result)) {
+      retryService("Служба обновляется… Подключусь автоматически.");
+      return;
+    }
+    useRuntime(result);
+    serviceFailures = 0;
+    lastProblem = "";
+    retryAfter = 0;
     state = result;
     if (result.error) {
       console.log("Local subtitle service: " + result.error);
@@ -386,11 +493,9 @@ function requestState(path, isEnabled, requestEpoch) {
     if (closed || requestEpoch !== epoch || !isEnabled || requestSeekGeneration !== seekGeneration) return;
     const code = error && error.statusCode;
     if (code === 401 || code === 403) token = "";
-    lastProblem = code === 401
+    retryService(code === 401
       ? "Обновляю подключение к локальному сервису…"
-      : "Локальный сервис перевода пока недоступен";
-    retryAfter = Date.now() + 3000;
-    bufferFailure(lastProblem);
+      : "Локальный сервис перевода пока недоступен");
     console.log(lastProblem);
   }).finally(() => {
     busy = false;
@@ -405,6 +510,10 @@ function tick() {
   if (closed) return;
   checkBufferTimeout();
   if (busy || Date.now() < retryAfter) return;
+  if (!serviceReady && (pendingStops.length || (enabled && mediaPath))) {
+    checkService();
+    return;
+  }
   if (pendingStops.length) {
     requestState(pendingStops.shift(), false, epoch);
   } else if (enabled && mediaPath) {
@@ -426,6 +535,7 @@ function clearMedia() {
   state = null;
   previousSid = "no";
   wantSelect = true;
+  followRussian = true;
   subtitleIntent = null;
   lastProblem = "";
 }
@@ -451,7 +561,10 @@ function setEnabled(value, selectTrack) {
   preferences.sync();
   if (enabled) {
     bufferBypass = null;
-    if (selectTrack !== false) wantSelect = true;
+    if (selectTrack !== false) {
+      wantSelect = true;
+      followRussian = true;
+    }
     lastProblem = "";
     retryAfter = 0;
     const track = subtitlePath ? ownTrack(subtitlePath) : null;

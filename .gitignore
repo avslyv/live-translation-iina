@@ -71,3 +71,7 @@ seek-buffer-verification.json
 .ruff_cache/
 .mypy_cache/
 .pyright/
+
+# Installed-runtime update transaction; generated locally.
+runtime-revision.json
+.runtime-revision-*.tmp

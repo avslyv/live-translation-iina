@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.3.2 — 2026-11-17
+
+### Automatic update recovery
+
+- Restart the service by default after installation and verify its loaded code,
+  protocol capabilities and new process ID before reporting success.
+- Watch completed runtime updates and let launchd start a fresh interpreter.
+  Atomic update markers and syntax checks prevent restarts during file copying.
+- Make the IINA launcher repair a missing or outdated worker while preserving an
+  already compatible running process.
+- Negotiate service compatibility before sending player state. Reconnect and
+  restore the native Russian track after code changes or same-version restarts.
+- Bound stalled requests, ignore late responses, and preserve explicit pauses,
+  hidden subtitles, other selected tracks and stopped translation.
+- Add regression coverage and a [live update test report](docs/UPDATE_TEST.md).
+
 ## 1.3.1 — 2026-11-17
 
 ### First-install reliability

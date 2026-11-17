@@ -20,12 +20,16 @@ import shlex
 import shutil
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 SOURCE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SOURCE))
 from live_translation.runtime_config import load_runtime_config  # noqa: E402
+from live_translation.runtime_lifecycle import (  # noqa: E402
+    begin_runtime_update,
+    finish_runtime_update,
+)
+from live_translation.service_control import ensure_service, start_agent  # noqa: E402, F401
 
 LABEL = "local.live-translation.iina"
 DEFAULT_WHISPER_MODEL = "mlx-community/whisper-large-v3-turbo"
@@ -157,43 +161,9 @@ def launch_agent(
     return service
 
 
-def start_agent(
-    agent: Path, label: str | None = None, *, attempts: int = 21, retry_delay: float = 0.5
-) -> None:
-    """Replace a per-user job, allowing launchd time to finish its prior bootout."""
-    if attempts < 1 or retry_delay < 0:
-        raise ValueError("LaunchAgent retry settings must be positive")
-    label = label or load_runtime_config().bridge_label
-    domain = f"gui/{os.getuid()}"
-    target = domain + "/" + label
-    subprocess.run(
-        ["/bin/launchctl", "bootout", target],
-        check=False,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    run("/bin/launchctl", "enable", target)
-    arguments = ["/bin/launchctl", "bootstrap", domain, str(agent)]
-    for attempt in range(attempts):
-        result = subprocess.run(arguments, check=False, capture_output=True, text=True, timeout=10)
-        if result.returncode == 0:
-            return
-        # launchctl can report EIO while an immediately preceding bootout is
-        # still tearing down the old job. Other failures should surface now.
-        if result.returncode != 5 or attempt == attempts - 1:
-            if result.stderr:
-                print(result.stderr.strip(), file=sys.stderr)
-            raise subprocess.CalledProcessError(
-                result.returncode,
-                arguments,
-                output=result.stdout,
-                stderr=result.stderr,
-            )
-        time.sleep(retry_delay)
-
-
 def install_launcher(app: Path, iina: Path, agent: Path, plugin_info: dict, backup: Path) -> None:
     config = load_runtime_config()
+    project = config.home / "Library/Application Support/LiveTranslate/project"
     if app.exists():
         shutil.copytree(app, backup / app.name, symlinks=True)
     contents = app / "Contents"
@@ -205,9 +175,9 @@ def install_launcher(app: Path, iina: Path, agent: Path, plugin_info: dict, back
             "export " + name + "=" + shlex.quote(value) + "\n"
             for name, value in config.environment().items()
         )
-        + f'launchctl bootstrap "gui/$(id -u)" {shlex.quote(str(agent))} >/dev/null 2>&1 || true\n'
-        f'launchctl kickstart "gui/$(id -u)/{config.bridge_label}" >/dev/null 2>&1 || true\n'
-        f"exec /usr/bin/open -a {shlex.quote(str(iina))}\n"
+        + f"cd {shlex.quote(str(project))}\n"
+        + f"{shlex.quote(str(project / '.venv/bin/python'))} -m live_translation.service_control --ensure\n"
+        + f"exec /usr/bin/open -a {shlex.quote(str(iina))}\n"
     )
     atomic_write(contents / "MacOS/LiveTranslationIINA", launcher.encode(), 0o755)
     info = {
@@ -260,8 +230,8 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument(
         "--start",
         action=argparse.BooleanOptionalAction,
-        default=False,
-        help="load/reload the LaunchAgent immediately",
+        default=True,
+        help="ensure the installed service is running (use --no-start to skip explicit loading)",
     )
     result.add_argument(
         "--launcher",
@@ -373,6 +343,7 @@ def main(argv: list[str] | None = None) -> int:
         if project.exists() and SOURCE.resolve() != project.resolve():
             old_runtime = backup / "runtime"
             copy_runtime(project, old_runtime, require_worker=False)
+        begin_runtime_update(project)
         copy_runtime(SOURCE, project)
         if args.install_dependencies:
             if not python.exists():
@@ -444,8 +415,9 @@ def main(argv: list[str] | None = None) -> int:
         )
         if args.launcher:
             install_launcher(app, iina, agent, info, backup)
+        revision = finish_runtime_update(project)
         if args.start:
-            start_agent(agent)
+            ensure_service(project, config=config, expected_runtime_id=revision, force_restart=True)
         print(f"Installed IINA integration {info['version']}\nRuntime: {project}\nBackup: {backup}")
         if args.launcher:
             print(f"Launcher: {app}")
@@ -456,10 +428,11 @@ def main(argv: list[str] | None = None) -> int:
             )
         if not args.start:
             print(
-                f"Start the service: launchctl bootstrap gui/{os.getuid()} {shlex.quote(str(agent))}"
+                f"Start the service: cd {shlex.quote(str(project))} && "
+                f"{shlex.quote(str(python))} -m live_translation.service_control --ensure"
             )
         return 0
-    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+    except (OSError, RuntimeError, ValueError, SyntaxError, subprocess.SubprocessError) as error:
         print(f"Installation failed: {error}", file=sys.stderr)
         print(
             "No video, subtitle cache, model weights or source checkout were removed.",

@@ -26,7 +26,14 @@ from installer.dependencies import ensure_ffmpeg, ensure_iina, ensure_ollama  # 
 from live_translation.local_http import local_urlopen  # noqa: E402
 from live_translation.model_download import download_ollama_model  # noqa: E402
 from live_translation.runtime_config import load_runtime_config  # noqa: E402
-from tools.install_iina import start_agent  # noqa: E402
+from live_translation.runtime_lifecycle import (  # noqa: E402
+    begin_runtime_update,
+    finish_runtime_update,
+    runtime_revision,
+    runtime_update_pending,
+)
+from live_translation.service_contract import compatible_health  # noqa: E402
+from live_translation.service_control import start_agent  # noqa: E402
 
 WHISPER = "mlx-community/whisper-large-v3-turbo"
 TRANSLATOR = "gemma4:12b"
@@ -157,6 +164,23 @@ def runtime_ready(python: Path) -> bool:
     )
     result = subprocess.run([str(python), "-c", script, json.dumps(expected)], capture_output=True)
     return result.returncode == 0
+
+
+def service_ready(project: Path) -> bool:
+    """Verify the loaded worker, rather than accepting an older HTTP listener."""
+    try:
+        if runtime_update_pending(project):
+            return False
+        expected = runtime_revision(project)
+        with local_urlopen(load_runtime_config().bridge_url + "/health", timeout=1) as response:
+            body = json.load(response)
+        return (
+            compatible_health(body, expected)
+            and not runtime_update_pending(project)
+            and runtime_revision(project) == expected
+        )
+    except (OSError, ValueError):
+        return False
 
 
 def ensure_ollama_server(binary: Path, support: Path, report: Reporter):
@@ -346,6 +370,7 @@ def install(report: Reporter):
         integration_attempted = False
         try:
             if not runtime_ready(python):
+                begin_runtime_update(project)
                 report.stage(
                     "runtime",
                     "Installing speech recognition libraries",
@@ -433,12 +458,8 @@ def install(report: Reporter):
             )
             report.stage("verification", "Checking translation service", 0.97)
             for _ in range(30):
-                try:
-                    with local_urlopen(runtime.bridge_url + "/health", timeout=3) as response:
-                        if json.load(response).get("status") == "ok":
-                            break
-                except (OSError, ValueError):
-                    pass
+                if service_ready(project):
+                    break
                 time.sleep(1)
             else:
                 raise RuntimeError(
@@ -456,8 +477,23 @@ def install(report: Reporter):
                 if (project / ".venv").exists():
                     shutil.rmtree(project / ".venv")
                 backup_venv.rename(project / ".venv")
+            # Before integration begins the old source is still intact. Release
+            # its marker only after restoring dependencies and validating it.
+            # A partially copied integration remains blocked until a retry.
+            if stopped and not integration_attempted:
+                try:
+                    finish_runtime_update(project)
+                except (OSError, RuntimeError, ValueError, SyntaxError) as restore_error:
+                    report(
+                        {
+                            "type": "log",
+                            "message": "Runtime recovery needs a retry: " + str(restore_error),
+                        }
+                    )
             if (stopped or integration_attempted) and previous_agent:
                 try:
+                    if runtime_update_pending(project):
+                        raise RuntimeError("The runtime update is incomplete; retry the installer.")
                     start_agent(agent, runtime.bridge_label)
                 except (OSError, RuntimeError, subprocess.SubprocessError) as restore_error:
                     report(

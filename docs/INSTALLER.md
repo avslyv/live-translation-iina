@@ -84,8 +84,15 @@ files do not need to be fetched again. Cancellation stops the installer's work;
 it does not remove existing videos, subtitle caches, or model weights.
 
 To update, download and run a newer installer from this repository's releases.
-IINA needs to be restarted to load a changed plugin. The installer does not force
-quit the player or discard an active viewing session.
+The installer restarts the translation service and verifies the newly loaded
+code and process before reporting completion. The plugin reconnects and restores
+its native Russian track automatically; pauses and explicit subtitle choices are
+preserved. No manual service command or repeated enable action is needed.
+
+IINA still needs to load changed plugin JavaScript, either when its plugins reload
+or when the player is normally reopened. The installer offers **Open IINA** and
+a normal restart reminder; it does not force quit an active viewing session.
+See the [update recovery test](UPDATE_TEST.md).
 
 The separate system-audio overlay still has its own
 [setup guide](OVERLAY.md). The graphical installer covers the native IINA mode.
@@ -96,7 +103,7 @@ Maintainers can build the installer on an Apple silicon Mac with Xcode Command
 Line Tools and Python 3.12+:
 
 ```bash
-python3 tools/build_installer.py --version 1.3.1
+python3 tools/build_installer.py --version 1.3.2
 ```
 
 This creates an application bundle, a DMG, a ZIP, and `SHA256SUMS` in `dist/`.
@@ -110,7 +117,7 @@ build:
 
 ```bash
 python3 tools/build_installer.py \
-  --version 1.3.1 \
+  --version 1.3.2 \
   --sign-identity "Developer ID Application: Your Name (TEAMID)" \
   --notary-profile release-notary
 ```

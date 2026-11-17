@@ -792,6 +792,10 @@ class BridgeTests(unittest.TestCase):
             status, health = request("GET", "/health")
             self.assertEqual(status, 200)
             self.assertNotIn("path", health)
+            self.assertEqual(health["version"], "1.3.2")
+            self.assertEqual(len(health["runtime_id"]), 64)
+            self.assertIn("state_form", health["capabilities"])
+            self.assertIn("auto_restart", health["capabilities"])
             self.assertEqual(request("GET", "/status")[0], 401)
             form = urlencode(
                 {
@@ -821,6 +825,8 @@ class BridgeTests(unittest.TestCase):
             status, state = request("POST", "/state", form, headers)
             self.assertEqual(status, 200)
             self.assertEqual(state["status"], "processing")
+            self.assertEqual(state["runtime_id"], health["runtime_id"])
+            self.assertEqual(state["protocol"], health["protocol"])
             self.assertFalse(self.bridge.paused)
             status, diagnostic = request(
                 "GET", "/status", headers={"Authorization": "Bearer " + token}
@@ -828,6 +834,7 @@ class BridgeTests(unittest.TestCase):
             self.assertEqual(status, 200)
             self.assertEqual(diagnostic["position"], 0)
             self.assertEqual(diagnostic["source"], str(self.video.resolve()))
+            self.assertEqual(diagnostic["runtime_id"], health["runtime_id"])
             self.assertFalse(diagnostic["paused"])
             self.assertEqual(
                 diagnostic["client"],

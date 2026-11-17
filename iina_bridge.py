@@ -45,6 +45,8 @@ from live_translation.media_cache import (
     validate_chunks,
 )
 from live_translation.runtime_config import load_runtime_config
+from live_translation.runtime_lifecycle import RuntimeWatcher, runtime_revision
+from live_translation.service_contract import SERVICE_NAME, service_identity
 from live_translation.sessions import export_subtitles
 from live_translation.text_pipeline import strip_hallucinations
 
@@ -1022,9 +1024,10 @@ class Bridge:
             self._unload()
 
 
-def server_for(bridge, token, port=PORT):
+def server_for(bridge, token, port=PORT, *, runtime_id=None):
     if not token or len(token) < 24:
         raise ValueError("An authentication token of at least 24 characters is required")
+    identity = service_identity(runtime_id or runtime_revision(Path(__file__).resolve().parent))
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format, *args):
@@ -1042,7 +1045,7 @@ def server_for(bridge, token, port=PORT):
         def do_GET(self):
             if self.path == "/health":
                 self.reply(
-                    200, {"status": "ok", "service": "iina-local-translation", "protocol": 1}
+                    200, {"status": "ok", "service": SERVICE_NAME, **identity}
                 )
             elif self.path == "/status":
                 if not hmac.compare_digest(
@@ -1054,6 +1057,7 @@ def server_for(bridge, token, port=PORT):
                     state = bridge._response()
                     state.update(
                         {
+                            **identity,
                             "position": bridge.position,
                             "paused": bridge.paused,
                             "source": str(bridge.active.source) if bridge.active else None,
@@ -1098,7 +1102,7 @@ def server_for(bridge, token, port=PORT):
                     return
                 if not isinstance(data, dict):
                     raise ValueError("The request must be an object")
-                self.reply(200, bridge.update(data))
+                self.reply(200, {**bridge.update(data), **identity})
             except (
                 ValueError,
                 TypeError,
@@ -1142,7 +1146,8 @@ def main():
         return 0
     try:
         token = (SUPPORT / "iina-token").read_text(encoding="utf-8").strip()
-        server = server_for(bridge, token, args.port)
+        loaded_revision = runtime_revision(Path(__file__).resolve().parent)
+        server = server_for(bridge, token, args.port, runtime_id=loaded_revision)
     except (ValueError, OSError) as error:
         bridge.close()
         print(f"[iina] startup failed: {error}", file=sys.stderr)
@@ -1153,10 +1158,20 @@ def main():
 
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
+
+    def runtime_changed(_revision):
+        print("[iina] runtime updated; restarting the local service", flush=True)
+        server.shutdown()
+
+    watcher = RuntimeWatcher(
+        Path(__file__).resolve().parent, runtime_changed, loaded_revision=loaded_revision
+    )
+    watcher.start()
     print(f"[iina] local subtitle bridge listening on 127.0.0.1:{args.port}", flush=True)
     try:
         server.serve_forever(poll_interval=0.5)
     finally:
+        watcher.close()
         bridge.close()
         server.server_close()
     return 0
