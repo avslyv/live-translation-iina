@@ -36,7 +36,7 @@ jobs:
       - name: Type check
         run: python -m pyright
       - name: Check shell syntax
-        run: bash -n setup.sh install-app.sh setup-iina.sh
+        run: bash -n setup.sh install-app.sh setup-iina.sh installer/bootstrap.sh
 
   python:
     name: Python ${{ matrix.python }} unit tests
@@ -82,3 +82,16 @@ jobs:
         run: node --check iina-plugin/main.js
       - name: Test native subtitle lifecycle and seek buffering
         run: node --test tests/test_plugin_autostart.js
+
+  installer:
+    name: macOS installer frontend
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build native frontend
+        run: xcrun swiftc -target arm64-apple-macosx14.0 -framework Cocoa installer/Installer.swift -o /tmp/live-translation-installer
+      - name: Test progress transport and cancellation
+        run: /tmp/live-translation-installer --self-test

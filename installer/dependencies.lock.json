@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "platform": "macos-arm64",
+  "artifacts": {
+    "iina": {
+      "version": "1.5.1",
+      "url": "https://github.com/iina/iina/releases/download/v1.5.1/IINA.v1.5.1.dmg",
+      "sha256": "f414507ec60bcfeda3a9f539f74470253e31b619d031e7a9e9a71519da1598cd",
+      "size": 113092405,
+      "filename": "IINA.v1.5.1.dmg",
+      "source": "https://api.github.com/repos/iina/iina/releases/tags/v1.5.1"
+    },
+    "ollama": {
+      "version": "0.40.16",
+      "url": "https://github.com/ollama/ollama/releases/download/v0.40.16/ollama-darwin.tgz",
+      "sha256": "a743717494315da7cd352982b805f6b992d4b4452ca117fd5fbf86c4ee46fca0",
+      "size": 186116182,
+      "filename": "ollama-darwin-0.40.16.tgz",
+      "source": "https://api.github.com/repos/ollama/ollama/releases/tags/v0.40.16"
+    },
+    "ffmpeg": {
+      "version": "imageio-ffmpeg-0.8.1",
+      "url": "https://files.pythonhosted.org/packages/2b/47/9f9b654f853598bae0850fa22bba168103e45d31b5a2a893ed474f28d54a/imageio_ffmpeg-0.8.1-py3-none-macosx_12_0_arm64.whl",
+      "sha256": "5636d691e36e5274b13fe38182b1f627b2e35dcecc63944012c2470f9484fc45",
+      "size": 22625474,
+      "filename": "imageio_ffmpeg-0.8.1-macosx_12_0_arm64.whl",
+      "binary": "imageio_ffmpeg/binaries/ffmpeg-macos-aarch64-v9.0",
+      "source": "https://pypi.org/pypi/imageio-ffmpeg/0.8.1/json"
+    }
+  }
+}

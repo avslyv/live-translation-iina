@@ -17,7 +17,7 @@ Inference runs locally on Apple silicon using **MLX Whisper + Ollama**. No API k
   <img src="docs/architecture.svg" alt="Local video flows through FFmpeg, Whisper, and Ollama into a persistent cache and native IINA subtitles; seeks prioritize the requested section." width="900">
 </p>
 
-[Quickstart](#quickstart--iina) · [Overlay mode](docs/OVERLAY.md) · [Architecture](docs/ARCHITECTURE.md) · [Русское руководство](IINA_SETUP_RU.md) · [Contributing](CONTRIBUTING.md)
+[Download installer](https://github.com/avslyv/live-translation-iina/releases/latest/download/Live-Translation-Installer-arm64.dmg) · [Quickstart](#quickstart--iina) · [Overlay mode](docs/OVERLAY.md) · [Architecture](docs/ARCHITECTURE.md) · [Русское руководство](IINA_SETUP_RU.md) · [Contributing](CONTRIBUTING.md)
 
 ## TL;DR
 
@@ -52,50 +52,27 @@ IINA video ──► FFmpeg ──► Whisper / MLX ──► Gemma / Ollama
 | Seeking | File timestamps, prioritized preparation | Follows live audio |
 | Cache | Content-addressed JSON + SRT | Separate session history |
 | Audio routing | Direct file decoding | BlackHole 2ch |
-| Setup | `./setup-iina.sh` | [Overlay guide](docs/OVERLAY.md) |
+| Setup | [Download the installer](https://github.com/avslyv/live-translation-iina/releases/latest/download/Live-Translation-Installer-arm64.dmg) | [Overlay guide](docs/OVERLAY.md) |
 
 ## Quickstart — IINA
 
-Requires an **Apple silicon Mac**, **macOS 14+**, **Python 3.12+** (3.13 recommended), **FFmpeg**, **Ollama**, and **IINA 1.3.5+**. The native integration has been manually verified with IINA 1.3.5 on an M4 Max Mac; model-free CI checks run separately on Linux.
+Requires an **Apple silicon Mac**, **macOS 14+**, and an internet connection for the first installation. You do not need Terminal, Homebrew, Python, FFmpeg, Ollama, or IINA already installed.
 
-### 1. Install prerequisites
+### 1. Download and open the installer
 
-With [Homebrew](https://brew.sh):
+**[Download Live Translation Installer for Apple silicon](https://github.com/avslyv/live-translation-iina/releases/latest/download/Live-Translation-Installer-arm64.dmg)**
 
-```bash
-brew install python@3.13 ffmpeg ollama
-brew install --cask iina
-```
+Open the disk image, then open **Live Translation Installer.app**. A [ZIP download](https://github.com/avslyv/live-translation-iina/releases/latest/download/Live-Translation-Installer-arm64.zip) is available too.
 
-Start the Ollama app, or run the CLI server in another terminal:
+This community build is ad-hoc signed and is not notarized by Apple. If macOS blocks the first launch, review the release and follow [Apple's instructions for opening an app you trust](https://support.apple.com/en-us/102445). That may require **System Settings → Privacy & Security → Open Anyway**. No Terminal command is required.
 
-```bash
-ollama serve
-```
+### 2. Click Install
 
-Use one Ollama server on `127.0.0.1:11434`. If it is already running, continue to the next step.
+The native installer shows each step and its progress. It installs or reuses the prerequisites, adds the IINA plugin and local service, and downloads Whisper and Gemma model weights. Existing model downloads, subtitle caches, and settings are retained; replaced integration settings are backed up.
 
-### 2. Install the integration
+Keep the disk image mounted until installation finishes. Model downloads are several gigabytes, so the first setup can take a while. When complete, use **Open IINA** and follow the restart reminder.
 
-```bash
-git clone https://github.com/avslyv/live-translation-iina.git
-cd live-translation-iina
-./setup-iina.sh
-```
-
-The installer creates an isolated runtime, downloads the default models, installs the IINA plugin, enables the plugin system, and registers a user LaunchAgent. Existing plugin and service settings are backed up before replacement. Model downloads are several gigabytes and require an internet connection.
-
-Preview the plan without changing anything:
-
-```bash
-./setup-iina.sh --dry-run
-```
-
-Already have the models locally?
-
-```bash
-./setup-iina.sh --no-download-models
-```
+The installer uses your user account's application and support folders. It does not require Homebrew or administrator access. See the [installer guide](docs/INSTALLER.md) for details, retry behavior, and developer builds.
 
 ### 3. Open a video
 
@@ -106,6 +83,21 @@ When the current section has not been translated, the plugin shows **«Гото�
 The plugin menu displays the prepared percentage. **100% means every section is cached** and all future seeks can reuse saved output. Before that, a first visit to a new section needs preparation. Errors or a wait longer than 45 seconds release an automatic pause while processing continues in the background.
 
 An optional **Live Translation for IINA.app** launcher is installed in `~/Applications`. It starts the service and opens IINA. The upstream `LiveTranslate.app` in this repository belongs to overlay mode.
+
+<details>
+<summary>Command-line installation for developers</summary>
+
+The original source installer remains available. Install Python 3.12+ (3.13 recommended), FFmpeg, Ollama, and IINA 1.3.5+, and start the local Ollama server first.
+
+```bash
+git clone https://github.com/avslyv/live-translation-iina.git
+cd live-translation-iina
+./setup-iina.sh
+```
+
+Use `./setup-iina.sh --dry-run` to preview the plan or `--no-download-models` to reuse downloaded weights. These commands are an alternative to the graphical installer.
+
+</details>
 
 ## Models and memory
 
@@ -153,7 +145,7 @@ New computation is not guaranteed to be bit-identical across different GPUs, eng
 
 ### Loopback only
 
-The bridge listens on `127.0.0.1:18743` and requires a generated local bearer token for file control and status. The installed plugin has loopback-network and OSD permissions; its scoped token is stored outside the repository. Ollama runs on `127.0.0.1:11434`. Hugging Face downloads are disabled during IINA playback.
+The bridge listens on `127.0.0.1:18743` and requires a generated local bearer token for file control and status. The installed plugin uses loopback-network and OSD permissions. IINA 1.5+ also requires its filesystem permission for native subtitle-file commands; older IINA versions do not. The scoped token stays outside the repository. Ollama runs on `127.0.0.1:11434`. Hugging Face downloads are disabled during IINA playback.
 
 See [architecture and protocol](docs/ARCHITECTURE.md) and the [security policy](SECURITY.md) for details.
 
@@ -233,7 +225,7 @@ Before attaching logs to an issue, remove tokens, private file paths, and transc
 - Initial preparation and uncached seeks take time. A powerful Mac helps, but a new section cannot show a translation before it has been processed.
 - Speech recognition and LLM translation can make mistakes, especially with music, accents, jargon, and mixed languages.
 - IINA's plugin system is enabled by the installer; future IINA API changes may require updates.
-- There is no notarized installer or bundled model download. Installation uses source code and an ad-hoc signed optional launcher.
+- The graphical installer is currently ad-hoc signed rather than Apple-notarized. It downloads prerequisites and models during setup; weights are not bundled in the release archive.
 
 ## Project structure
 
@@ -242,7 +234,9 @@ iina_bridge.py               file decoding, scheduling, model lifecycle, HTTP br
 iina-plugin/                 native subtitle plugin for IINA
 live_translation/            shared pipeline, translators, determinism, cache identity
 tools/install_iina.py        portable IINA installer
-setup-iina.sh                IINA setup entry point
+setup-iina.sh                developer CLI setup entry point
+installer/                   native macOS installer and bootstrap
+tools/build_installer.py     signed app, DMG, ZIP and checksum packaging
 live_translate_overlay.py   original system audio pipeline and Cocoa overlay
 LiveTranslate.app/           original overlay app bundle
 docs/                       architecture and overlay guide

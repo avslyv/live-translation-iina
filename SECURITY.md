@@ -24,6 +24,11 @@ video and writes subtitle caches in the user's Application Support directory.
 Its token is generated during installation and is not part of the repository.
 Ollama is a separate local service. Models must be downloaded before offline use.
 
+The installed plugin uses IINA's loopback network and OSD permissions. On IINA
+1.5+, native subtitle-file commands also require the filesystem permission. The
+installer retains that permission for those versions while removing direct
+JavaScript filesystem calls from the installed bridge.
+
 Reports involving unauthorized file access, token disclosure, remote exposure, or
 unsafe installer behavior are in scope. Translation inaccuracies and transcription
 hallucinations normally belong in a regular bug report.

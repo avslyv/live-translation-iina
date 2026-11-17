@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.3.0 — 2026-11-17
+
+### Downloadable macOS installer
+
+- Added a native installer app with one-button setup, progress, details, retry,
+  cancellation, and an option to reopen IINA. No Terminal or Homebrew is required.
+- Provision a private Python runtime, IINA, FFmpeg and Ollama from pinned,
+  SHA-256-verified artifacts when working installations are unavailable.
+- Download Whisper and Gemma locally, reuse installed models and subtitle caches,
+  and verify the models before activating the integration.
+- Added arm64 DMG/ZIP builds, release checksums, and a GitHub release workflow.
+  Public builds are ad-hoc signed; Developer ID signing and notarization are
+  supported when the required signing credentials are configured.
+- Added FFmpeg-only probing for the portable runtime, version-aware subtitle
+  permissions for IINA 1.5+, transient LaunchAgent restart retries, and installer
+  regression tests for cancellation, integrity and environment recovery.
+
 ## 1.2.0 — 2026-11-16
 
 ### Native IINA subtitles

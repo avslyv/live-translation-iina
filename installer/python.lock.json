@@ -1,0 +1,8 @@
+{
+  "version": "3.13.18",
+  "release": "20261110",
+  "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20261110/cpython-3.13.18%2B20261110-aarch64-apple-darwin-install_only.tar.gz",
+  "sha256": "1afd3983237c2a10277345f235be730e9cb49a123e0574ed252dbf3a841a24e4",
+  "size": 25598083,
+  "source": "https://github.com/astral-sh/python-build-standalone/releases/tag/20261110"
+}

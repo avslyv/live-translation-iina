@@ -68,7 +68,7 @@ Heartbeats expire after 12 seconds without IINA updates. The worker then stops p
 
 Recognition uses installed local Whisper weights; playback does not download models. Translation talks to Ollama on `127.0.0.1:11434`. Initial dependency and model installation requires network access.
 
-The installer creates a scoped service token and embeds it only in the installed plugin, outside the source checkout. The installed plugin needs loopback networking and IINA OSD permissions. Audio is decoded from the file, without microphone capture or audio-device routing.
+The installer creates a scoped service token and embeds it only in the installed plugin, outside the source checkout. The installed plugin needs loopback networking and IINA OSD permissions. IINA 1.5+ also guards native subtitle-file commands with its filesystem permission, so the installer retains that permission for those versions. Direct JavaScript filesystem calls are removed from the installed plugin. Audio is decoded from the file, without microphone capture or audio-device routing.
 
 Caches contain transcript text, translations, timing and the source file path. They stay on the Mac and should be treated as private media-derived data. Diagnostic responses can also contain local paths; do not attach them to public issues without reviewing them.
 

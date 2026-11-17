@@ -2,6 +2,7 @@
 
 import importlib.util
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -43,7 +44,11 @@ class InstallerTests(unittest.TestCase):
             (source / "live_translation/__init__.py").write_text("")
             installer.copy_runtime(source, destination)
             self.assertEqual(
-                {str(path.relative_to(destination)) for path in destination.rglob("*") if path.is_file()},
+                {
+                    str(path.relative_to(destination))
+                    for path in destination.rglob("*")
+                    if path.is_file()
+                },
                 {"iina_bridge.py", "requirements-iina.txt", "live_translation/__init__.py"},
             )
             # Repeated updates preserve the installed venv instead of moving it.
@@ -57,8 +62,12 @@ class InstallerTests(unittest.TestCase):
 
     def test_launch_agent_uses_resolved_executables_and_offline_models(self):
         service = installer.launch_agent(
-            Path("/Users/example/Runtime"), Path("/Users/example/Support"),
-            "/custom/bin/ffmpeg", "/custom/bin/ffprobe", "test/whisper", "test-model:12b",
+            Path("/Users/example/Runtime"),
+            Path("/Users/example/Support"),
+            "/custom/bin/ffmpeg",
+            "/custom/bin/ffprobe",
+            "test/whisper",
+            "test-model:12b",
         )
         environment = service["EnvironmentVariables"]
         self.assertEqual(environment["LT_FFMPEG"], "/custom/bin/ffmpeg")
@@ -68,10 +77,96 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(environment["HF_HUB_OFFLINE"], "1")
         self.assertNotIn("token", str(service).lower())
 
+    def test_launch_agent_can_use_portable_ffmpeg_without_ffprobe(self):
+        service = installer.launch_agent(
+            Path("/example/Runtime"),
+            Path("/example/Support"),
+            "/portable/ffmpeg",
+            None,
+            "test/whisper",
+            "test-model:12b",
+        )
+        self.assertEqual(service["EnvironmentVariables"]["LT_FFMPEG"], "/portable/ffmpeg")
+        self.assertNotIn("LT_FFPROBE", service["EnvironmentVariables"])
+
+    def test_environment_override_selects_the_private_ffmpeg(self):
+        with (
+            mock.patch.dict(installer.os.environ, {"LT_FFMPEG": "/private-engine/ffmpeg"}),
+            mock.patch.object(
+                installer.shutil, "which", return_value="/private-engine/ffmpeg"
+            ) as which,
+        ):
+            self.assertEqual(installer.command("ffmpeg"), "/private-engine/ffmpeg")
+        which.assert_called_once_with("/private-engine/ffmpeg", path=installer.SEARCH_PATH)
+
+    def test_native_subtitle_permission_matches_iina_api_version(self):
+        original = {"permissions": ["network-request", "file-system", "show-osd"]}
+        for version, needs_filesystem in (
+            ((1, 3, 5), False),
+            ((1, 4, 0), False),
+            ((1, 5, 0), True),
+            ((1, 5, 1), True),
+        ):
+            with self.subTest(version=version):
+                metadata = installer.installed_plugin_metadata(original, version)
+                self.assertEqual("file-system" in metadata["permissions"], needs_filesystem)
+        self.assertIn("file-system", original["permissions"])
+
+    def test_start_agent_retries_transient_bootstrap_eio_after_enabling_the_job(self):
+        ok = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        busy = subprocess.CompletedProcess(
+            [], 5, stdout="", stderr="Bootstrap failed: 5: Input/output error"
+        )
+        with (
+            mock.patch.object(
+                installer.subprocess, "run", side_effect=[ok, ok, busy, ok]
+            ) as process,
+            mock.patch.object(installer.time, "sleep") as sleep,
+        ):
+            installer.start_agent(Path("/example/agent.plist"), "test.agent", attempts=3)
+        commands = [list(call.args[0]) for call in process.call_args_list]
+        self.assertEqual(
+            [command[1] for command in commands], ["bootout", "enable", "bootstrap", "bootstrap"]
+        )
+        self.assertEqual(commands[-1][-1], "/example/agent.plist")
+        sleep.assert_called_once_with(0.5)
+
+    def test_start_agent_keeps_the_permanent_error_after_bounded_eio_retries(self):
+        ok = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        failed = subprocess.CompletedProcess([], 5, stdout="", stderr="invalid job fixture")
+        with (
+            mock.patch.object(
+                installer.subprocess, "run", side_effect=[ok, ok, failed, failed, failed]
+            ) as process,
+            mock.patch.object(installer.time, "sleep") as sleep,
+            mock.patch.object(installer.sys, "stderr"),
+            self.assertRaises(subprocess.CalledProcessError) as raised,
+        ):
+            installer.start_agent(Path("/example/agent.plist"), attempts=3)
+        self.assertEqual(raised.exception.returncode, 5)
+        self.assertEqual(raised.exception.stderr, "invalid job fixture")
+        self.assertEqual(process.call_count, 5)
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_start_agent_does_not_retry_an_unrelated_launchctl_error(self):
+        ok = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        failed = subprocess.CompletedProcess([], 125, stdout="", stderr="invalid domain fixture")
+        with (
+            mock.patch.object(installer.subprocess, "run", side_effect=[ok, ok, failed]),
+            mock.patch.object(installer.time, "sleep") as sleep,
+            mock.patch.object(installer.sys, "stderr"),
+            self.assertRaises(subprocess.CalledProcessError) as raised,
+        ):
+            installer.start_agent(Path("/example/agent.plist"))
+        self.assertEqual(raised.exception.returncode, 125)
+        sleep.assert_not_called()
+
     def test_dry_run_never_writes_or_starts_a_process(self):
-        with mock.patch.object(installer, "atomic_write") as write, \
-                mock.patch.object(installer.subprocess, "run") as process, \
-                mock.patch("builtins.print"):
+        with (
+            mock.patch.object(installer, "atomic_write") as write,
+            mock.patch.object(installer.subprocess, "run") as process,
+            mock.patch("builtins.print"),
+        ):
             self.assertEqual(installer.main(["--dry-run", "--start", "--download-models"]), 0)
         write.assert_not_called()
         process.assert_not_called()

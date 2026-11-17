@@ -3,12 +3,13 @@
 import http.client
 import io
 import json
+import subprocess
 import threading
 from unittest import mock
 
 import pytest
 
-from iina_bridge import ollama_version, resolve_executable, server_for
+from iina_bridge import Bridge, ollama_version, resolve_executable, server_for
 
 
 def test_ffmpeg_uses_path_instead_of_a_homebrew_prefix(monkeypatch):
@@ -26,6 +27,37 @@ def test_configured_ffprobe_is_resolved_and_validated(monkeypatch):
     ):
         resolve_executable("ffprobe")
     which.assert_called_once_with("/custom/bin/ffprobe")
+
+
+def test_probe_uses_ffmpeg_when_the_portable_runtime_has_no_ffprobe(monkeypatch, tmp_path):
+    monkeypatch.delenv("LT_FFPROBE", raising=False)
+    monkeypatch.delenv("LT_FFMPEG", raising=False)
+    bridge = Bridge(tmp_path / "cache", start_worker=False, profile={"fixture": True})
+    response = subprocess.CompletedProcess(
+        [], 1, stdout=b"", stderr=b"Duration: 01:02:03.45, start: 0.0"
+    )
+    with (
+        mock.patch("iina_bridge.shutil.which", side_effect=[None, "/portable/ffmpeg"]),
+        mock.patch("iina_bridge.subprocess.run", return_value=response) as process,
+    ):
+        assert bridge._probe(tmp_path / "movie.mp4") == pytest.approx(3723.45)
+    assert process.call_args.args[0][0] == "/portable/ffmpeg"
+    assert process.call_args.kwargs["check"] is False
+    bridge.close()
+
+
+@pytest.mark.parametrize("detail", [b"Duration: N/A", b"Duration: 00:00:00.00", b"not media"])
+def test_ffmpeg_duration_fallback_rejects_unusable_media(monkeypatch, tmp_path, detail):
+    monkeypatch.delenv("LT_FFPROBE", raising=False)
+    bridge = Bridge(tmp_path / "cache", start_worker=False, profile={"fixture": True})
+    response = subprocess.CompletedProcess([], 1, stdout=b"", stderr=detail)
+    with (
+        mock.patch("iina_bridge.shutil.which", side_effect=[None, "/portable/ffmpeg"]),
+        mock.patch("iina_bridge.subprocess.run", return_value=response),
+        pytest.raises(ValueError, match="no usable duration"),
+    ):
+        bridge._probe(tmp_path / "movie.mp4")
+    bridge.close()
 
 
 def test_ollama_fingerprints_the_running_server_not_an_app_bundle():

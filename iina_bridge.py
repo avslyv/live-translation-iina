@@ -274,22 +274,44 @@ class Bridge:
             self.worker.start()
 
     def _probe(self, path):
-        process = subprocess.run(
-            [
-                resolve_executable("ffprobe"),
-                "-v",
-                "error",
-                "-show_entries",
-                "format=duration",
-                "-of",
-                "json",
-                str(path),
-            ],
-            capture_output=True,
-            check=True,
-            timeout=20,
+        probe = (
+            resolve_executable("ffprobe")
+            if os.environ.get("LT_FFPROBE")
+            else shutil.which("ffprobe")
         )
-        duration = float(json.loads(process.stdout)["format"]["duration"])
+        if probe:
+            process = subprocess.run(
+                [
+                    probe,
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "json",
+                    str(path),
+                ],
+                capture_output=True,
+                check=True,
+                timeout=20,
+            )
+            duration = float(json.loads(process.stdout)["format"]["duration"])
+        else:
+            # The verified portable FFmpeg wheel includes the decoder executable
+            # but not ffprobe. FFmpeg reports container duration before exiting
+            # with its normal "no output file" status, so that status is expected.
+            process = subprocess.run(
+                [resolve_executable("ffmpeg"), "-nostdin", "-hide_banner", "-i", str(path)],
+                capture_output=True,
+                check=False,
+                timeout=20,
+            )
+            detail = process.stderr.decode(errors="replace")
+            match = re.search(r"\bDuration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", detail)
+            if not match:
+                raise ValueError("The video has no usable duration")
+            hours, minutes, seconds = (float(value) for value in match.groups())
+            duration = hours * 3600 + minutes * 60 + seconds
         if not math.isfinite(duration) or duration <= 0:
             raise ValueError("The video has no usable duration")
         return duration
