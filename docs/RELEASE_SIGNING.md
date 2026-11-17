@@ -1,9 +1,47 @@
 # Release signing and verification
 
-The default community build is **ad-hoc signed and not notarized by Apple**.
-Adding notarization support does not turn an ad-hoc release into a notarized
-release. `Live-Translation-Installer-arm64.verification.json` records the result
-for each specific build, together with its artifact hashes.
+Local builds reuse a **persistent local signing certificate**, using the same
+pattern as codex-switcher. GitHub Actions defaults to ad-hoc signing unless a
+Developer ID identity is configured. Neither local signing nor ad-hoc signing
+provides Apple notarization. `Live-Translation-Installer-arm64.verification.json`
+records the actual mode, public certificate identity and artifact hashes.
+
+## Persistent local signing
+
+On this Mac, a normal build uses `Live Translation Local Build` automatically:
+
+```sh
+python3 tools/build_installer.py
+```
+
+The certificate and non-exportable private key are created once in a dedicated
+keychain under `~/Library/Application Support/LiveTranslate/build-signing`.
+The directory is private (`0700`); its certificate, keychain and password file
+are private user-owned files. Keep this directory between builds. An incomplete
+or unsafe identity fails closed rather than silently creating a replacement.
+`LT_SIGNING_DIR` can select another persistent private directory.
+
+The app, DMG and locally installed IINA launcher use the local certificate.
+Signing temporarily adds the dedicated keychain to the search list and restores
+the original list, including on ordinary errors or interruption. System trust
+settings are not changed, and no Apple account or timestamp service is used.
+Private signing files are excluded from the installer payload and release assets.
+
+Stable bundle IDs and the same certificate preserve the designated requirement
+across changed builds. Replacing a former ad-hoc identity may still require an
+initial permission decision; individual macOS permission behavior is not certified
+by signature verification alone. Local signing does not establish Developer ID
+or Gatekeeper approval on another Mac.
+
+Use `--sign-identity local` explicitly for this mode, or `--sign-identity -` for
+an ad-hoc build. `MACOS_SIGNING_IDENTITY` overrides the default. The optional
+Developer ID path below remains separate and requires its real credentials.
+
+Native validation compared two changed builds (1.4.0 and a test-only 1.4.1):
+both passed strict signature and frontend checks, their CDHashes differed, their
+leaf certificate and designated requirement matched, and the new app satisfied
+the previous app's requirement. The installed launcher was also signed locally.
+See [the machine-readable result](validation/local-signing-1.4.0.json).
 
 ## What the build verifies
 
@@ -102,13 +140,11 @@ published release; a CI rerun does not replace its existing installer bytes.
 
 ## Verification limits and external prerequisites
 
-During the current development session the host reported **zero valid code
-signing identities**. No signing certificate, private key, Apple account, or
-notarization credential was inspected or imported. Consequently the notarized
-path is covered by automated command/protocol tests, and an actual Apple
-submission remains pending authorized signing material. A community release
-must continue to disclose that it is not notarized until a particular build has
-the successful evidence above.
+No Developer ID certificate or Apple notarization credential is configured.
+The new local certificate was created and used for native builds, but no Apple
+submission was made. The notarized path remains covered by command/protocol
+tests; a build must disclose that it is not notarized until it has the successful
+Apple evidence above.
 
 A fresh macOS VM or separate Mac should independently verify the downloaded
 artifact's first launch, a single-click installation from absent prerequisites,

@@ -46,6 +46,7 @@ def no_native_or_credential_operations(monkeypatch):
         raise AssertionError("Build unit tests must not execute native tools or touch credentials")
 
     monkeypatch.setattr(builder, "run", forbidden)
+    monkeypatch.setattr(builder, "sign_local", forbidden)
     monkeypatch.setattr(builder.subprocess, "check_output", forbidden)
 
 
@@ -378,4 +379,121 @@ def test_failed_notarization_never_replaces_existing_release_files(simulated_bui
     ):
         builder.build(args)
     assert old.read_bytes() == b"existing verified release fixture"
+    assert not (args.output_dir / "SHA256SUMS").exists()
+
+
+@pytest.mark.parametrize(
+    "environment,expected",
+    [
+        ({}, "local"),
+        ({"GITHUB_ACTIONS": "true"}, "-"),
+        ({"GITHUB_ACTIONS": "false"}, "local"),
+        ({"MACOS_SIGNING_IDENTITY": "-"}, "-"),
+        ({"MACOS_SIGNING_IDENTITY": "local", "GITHUB_ACTIONS": "true"}, "local"),
+        (
+            {
+                "MACOS_SIGNING_IDENTITY": "Developer ID Application: Example (ABCDE12345)",
+                "GITHUB_ACTIONS": "true",
+            },
+            "Developer ID Application: Example (ABCDE12345)",
+        ),
+    ],
+)
+def test_signing_default_preserves_explicit_identity_and_ci_ad_hoc(environment, expected):
+    assert builder.default_sign_identity(environment) == expected
+
+
+def local_signature_fixture():
+    return {
+        "mode": "local-certificate",
+        "authority": "Live Translation Local Build",
+        "certificate_sha1": "12" * 20,
+        "certificate_sha256": "34" * 32,
+        "designated_requirement": 'identifier "test.installer" and certificate leaf = H"' + "12" * 20 + '"',
+    }
+
+
+def test_local_app_dispatch_uses_dedicated_signer_without_developer_id_checks(tmp_path):
+    app = tmp_path / "Installer.app"
+    signature = local_signature_fixture()
+    with mock.patch.object(builder, "sign_local", return_value=signature) as local:
+        assert builder.sign_app(app, "local") == signature
+    local.assert_called_once_with(app)
+
+
+def test_local_build_signs_app_and_disk_image_and_reports_without_apple_claims(simulated_build):
+    args, commands = simulated_build
+    args.sign_identity = "local"
+    signature = local_signature_fixture()
+    with mock.patch.object(builder, "sign_local", return_value=signature) as local:
+        result = builder.build(args)
+    assert local.call_count == 2
+    app_call, image_call = local.call_args_list
+    assert app_call.args[0].suffix == ".app" and app_call.kwargs == {}
+    assert image_call.args[0].suffix == ".dmg" and image_call.kwargs == {"hardened": False}
+    report = json.loads(result["verification"].read_text())
+    assert report["signing"] == "local-certificate"
+    assert report["local_signature"] == signature
+    assert report["local_disk_image_signature"] == signature
+    assert report["notarized"] is False and report["gatekeeper_assessed"] is False
+    assert report["notarization"] == {}
+    assert not any(
+        "notarytool" in command or "stapler" in command or "/usr/sbin/spctl" in command
+        for command in commands
+    )
+    for line in result["checksums"].read_text().splitlines():
+        digest, name = line.split("  ", 1)
+        assert digest == builder.file_hash(args.output_dir / name)
+    with zipfile.ZipFile(result["zip"]) as archive:
+        metadata = json.loads(
+            archive.read(builder.APP_NAME + "/Contents/Resources/installer-build.json")
+        )
+    assert metadata["signing"] == "local-certificate"
+
+
+@pytest.mark.parametrize("option", ["notary_profile", "keychain"])
+def test_local_build_rejects_apple_notary_or_external_keychain_before_any_native_call(
+    simulated_build, option,
+):
+    args, commands = simulated_build
+    args.sign_identity = "local"
+    setattr(args, option, "fixture-notary" if option == "notary_profile" else Path("/fixture/keychain"))
+    with pytest.raises(RuntimeError, match="Developer ID|dedicated keychain"):
+        builder.build(args)
+    assert commands == []
+    assert not args.output_dir.exists()
+
+
+@pytest.mark.parametrize("failure_suffix", [".app", ".dmg"])
+def test_failed_local_signature_never_replaces_existing_release_files(
+    simulated_build, failure_suffix,
+):
+    args, _commands = simulated_build
+    args.output_dir.mkdir()
+    old = args.output_dir / (builder.ARTIFACT + ".dmg")
+    old.write_bytes(b"existing verified release fixture")
+    args.sign_identity = "local"
+
+    def sign(bundle, **_kwargs):
+        if bundle.suffix == failure_suffix:
+            raise RuntimeError("local signing failed fixture")
+        return local_signature_fixture()
+
+    with (
+        mock.patch.object(builder, "sign_local", side_effect=sign),
+        pytest.raises(RuntimeError, match="local signing failed fixture"),
+    ):
+        builder.build(args)
+    assert old.read_bytes() == b"existing verified release fixture"
+    assert not (args.output_dir / "SHA256SUMS").exists()
+
+
+def test_local_build_requires_certificate_metadata_before_publishing(simulated_build):
+    args, _commands = simulated_build
+    args.sign_identity = "local"
+    with (
+        mock.patch.object(builder, "sign_local", return_value=None),
+        pytest.raises(RuntimeError, match="certificate identity"),
+    ):
+        builder.build(args)
     assert not (args.output_dir / "SHA256SUMS").exists()

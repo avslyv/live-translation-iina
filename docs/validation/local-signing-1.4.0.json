@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "date": "2026-11-17",
+  "signing": "local-certificate",
+  "authority": "Live Translation Local Build",
+  "versions_tested": [
+    "1.4.0",
+    "1.4.1"
+  ],
+  "certificate_sha256": "F652822296DB119C171C0FC05516C662CBF7DE3CCB86D5CEDD5C28A0C8442253",
+  "same_leaf_certificate": true,
+  "same_designated_requirement": true,
+  "different_cdhash": true,
+  "new_build_satisfies_previous_requirement": true,
+  "embedded_certificate_matches_store": true,
+  "strict_native_verification": true,
+  "native_frontend_self_tests": true,
+  "private_keychain_removed_from_search_list": true,
+  "notarized": false,
+  "system_trust_modified": false,
+  "zip_extracted_signature_verified": true,
+  "dmg_embedded_signature_verified": true,
+  "installed_launcher_signed": true,
+  "changed_launcher_satisfies_previous_requirement": true
+}

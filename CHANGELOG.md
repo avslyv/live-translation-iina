@@ -2,6 +2,10 @@
 
 ## 1.4.0 — release candidate
 
+- Reuse a private local signing certificate for installer/DMG and the installed
+  IINA launcher, preserving their identity across local rebuilds without changing
+  trust settings. Keep ad-hoc CI and Developer ID/notarization as explicit modes.
+
 ### Sources, native sidebar and durable versions
 
 - Prefer a full source-language text subtitle track, including external SRT/ASS/SSA

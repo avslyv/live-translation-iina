@@ -103,7 +103,7 @@ Maintainers can build the installer on an Apple silicon Mac with Xcode Command
 Line Tools and Python 3.12+:
 
 ```bash
-python3 tools/build_installer.py --version 1.3.2
+python3 tools/build_installer.py --version 1.4.0
 ```
 
 This creates an application bundle, a DMG, a ZIP, and `SHA256SUMS` in `dist/`.
@@ -111,13 +111,17 @@ The build compiles a native AppKit frontend, copies an explicit source payload,
 signs the app, and runs the frontend's noninteractive self-test. It does not run
 the actual installer, download models, or copy local installation data.
 
-The default signature is ad-hoc. A maintainer with a Developer ID Application
-certificate and an existing `notarytool` keychain profile can produce a notarized
-build:
+Local builds create and reuse a private `Live Translation Local Build`
+certificate, and the installed launcher uses the same persistent local identity.
+No system trust settings are changed. This preserves the signing requirement
+between local builds; see [local signing](RELEASE_SIGNING.md#persistent-local-signing).
+GitHub Actions keeps its ad-hoc default, and `--sign-identity -` selects it explicitly.
+A maintainer with a Developer ID Application certificate and an existing
+`notarytool` keychain profile can produce a notarized build:
 
 ```bash
 python3 tools/build_installer.py \
-  --version 1.3.2 \
+  --version 1.4.0 \
   --sign-identity "Developer ID Application: Your Name (TEAMID)" \
   --notary-profile release-notary
 ```

@@ -26,6 +26,9 @@ import zipfile
 from pathlib import Path
 
 SOURCE = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(SOURCE))
+from tools.local_signing import sign_local  # noqa: E402
+
 APP_NAME = "Live Translation Installer.app"
 EXECUTABLE = "LiveTranslationInstaller"
 ARTIFACT = "Live-Translation-Installer-arm64"
@@ -37,6 +40,7 @@ REQUIRED_PAYLOAD = (
     "requirements-iina.lock.txt",
     "LICENSE",
     "tools/install_iina.py",
+    "tools/local_signing.py",
     "iina-plugin/main.js",
     "iina-plugin/Info.json",
     "iina-plugin/sidebar.html",
@@ -113,7 +117,9 @@ def signing_arguments(
     return arguments
 
 
-def sign_app(app: Path, identity: str, keychain: Path | None = None) -> None:
+def sign_app(app: Path, identity: str, keychain: Path | None = None) -> dict | None:
+    if identity == "local":
+        return sign_local(app)
     arguments = signing_arguments(identity, keychain)
     run(*arguments, str(app))
     run("/usr/bin/codesign", "--verify", "--deep", "--strict", str(app))
@@ -136,6 +142,19 @@ def sign_app(app: Path, identity: str, keychain: Path | None = None) -> None:
             raise RuntimeError(
                 "The app lacks a timestamped Developer ID hardened-runtime signature"
             )
+    return None
+
+
+def default_sign_identity(environ=None):
+    environ = os.environ if environ is None else environ
+    configured = environ.get("MACOS_SIGNING_IDENTITY")
+    if configured:
+        return configured
+    return "-" if environ.get("GITHUB_ACTIONS") == "true" else "local"
+
+
+def signing_label(identity):
+    return {"-": "ad-hoc", "local": "local-certificate"}.get(identity, "Developer ID Application")
 
 
 def zip_app(app: Path, destination: Path) -> None:
@@ -286,9 +305,15 @@ def pack_plugin(source: Path, destination: Path) -> None:
 def build(args: argparse.Namespace) -> dict[str, Path]:
     if platform.system() != "Darwin" or platform.machine() != "arm64":
         raise RuntimeError("Build the installer on an Apple silicon Mac")
-    if args.notary_profile and args.sign_identity == "-":
+    if args.notary_profile and args.sign_identity in {"-", "local"}:
         raise RuntimeError("Notarization requires a Developer ID Application signing identity")
-    signing_arguments(args.sign_identity, args.keychain)
+    if args.sign_identity == "local":
+        if args.keychain is not None:
+            raise RuntimeError(
+                "Local signing uses its dedicated keychain; configure LT_SIGNING_DIR instead"
+            )
+    else:
+        signing_arguments(args.sign_identity, args.keychain)
     if not re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?", args.version):
         raise RuntimeError("Use a semantic release version such as 1.3.0")
     source = SOURCE.resolve()
@@ -334,7 +359,7 @@ def build(args: argparse.Namespace) -> dict[str, Path]:
             "version": args.version,
             "architecture": "arm64",
             "minimum_macos": "14.0",
-            "signing": "ad-hoc" if args.sign_identity == "-" else "Developer ID",
+            "signing": signing_label(args.sign_identity),
             "notarization_requested": bool(args.notary_profile),
             "payload_sha256": hashes,
         }
@@ -363,7 +388,7 @@ def build(args: argparse.Namespace) -> dict[str, Path]:
             "-o",
             str(binary),
         )
-        sign_app(app, args.sign_identity, args.keychain)
+        local_signature = sign_app(app, args.sign_identity, args.keychain)
         run(str(binary), "--self-test")
         run("/usr/bin/codesign", "--verify", "--deep", "--strict", str(app))
         archive = work / (ARTIFACT + ".zip")
@@ -371,11 +396,15 @@ def build(args: argparse.Namespace) -> dict[str, Path]:
         verification = {
             "schema": 1,
             "version": args.version,
-            "signing": "ad-hoc" if args.sign_identity == "-" else "Developer ID Application",
+            "signing": signing_label(args.sign_identity),
             "notarized": False,
             "gatekeeper_assessed": False,
             "notarization": {},
         }
+        if args.sign_identity == "local":
+            if local_signature is None:
+                raise RuntimeError("Local signing did not return its certificate identity")
+            verification["local_signature"] = local_signature
         if args.notary_profile:
             verification["notarization"]["app"] = notarize(
                 archive, args.notary_profile, args.keychain
@@ -412,6 +441,8 @@ def build(args: argparse.Namespace) -> dict[str, Path]:
             "-ov",
             str(image),
         )
+        if args.sign_identity == "local":
+            verification["local_disk_image_signature"] = sign_local(image, hardened=False)
         if args.notary_profile:
             run(*signing_arguments(args.sign_identity, args.keychain, hardened=False), str(image))
             verification["notarization"]["dmg"] = notarize(
@@ -478,8 +509,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output-dir", type=Path, default=SOURCE / "dist")
     parser.add_argument(
         "--sign-identity",
-        default=os.environ.get("MACOS_SIGNING_IDENTITY", "-"),
-        help="codesign identity; '-' creates an ad-hoc signature",
+        default=default_sign_identity(),
+        help="'local' reuses a local certificate (default on your Mac); '-' is ad-hoc; or use a Developer ID identity",
     )
     parser.add_argument(
         "--notary-profile",
