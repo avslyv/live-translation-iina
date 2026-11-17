@@ -82,7 +82,14 @@ def _timestamp(value):
     return value
 
 
-def validate_chunks(raw, duration, chunk_seconds, required_fields=("source", "translated")):
+def validate_chunks(
+    raw,
+    duration,
+    chunk_seconds,
+    required_fields=("source", "translated"),
+    *,
+    allow_cross_boundary=False,
+):
     """Keep only complete, valid chunks; invalid chunks can be regenerated.
 
     Empty lists are completed silence. One malformed cue invalidates its whole
@@ -117,16 +124,26 @@ def validate_chunks(raw, duration, chunk_seconds, required_fields=("source", "tr
                 if not isinstance(cue, dict):
                     raise ValueError("A subtitle cue must be an object")
                 start, end = _timestamp(cue.get("start")), _timestamp(cue.get("end"))
-                if not (
+                valid_time = (
                     core_start - TIMESTAMP_EPSILON <= start < end <= core_end + TIMESTAMP_EPSILON
-                ):
+                )
+                if allow_cross_boundary:
+                    owner = _timestamp(cue.get("owner_start", start))
+                    valid_time = (
+                        core_start - TIMESTAMP_EPSILON <= owner < core_end
+                        and owner <= start < end <= duration + TIMESTAMP_EPSILON
+                    )
+                if not valid_time:
                     raise ValueError("A subtitle cue lies outside its chunk")
                 if any(
                     not isinstance(cue.get(field), str) or not cue[field].strip()
                     for field in required_fields
                 ):
                     raise ValueError("Required subtitle text is missing")
-                start, end = max(core_start, start), min(core_end, end)
+                start, end = (
+                    max(core_start, start),
+                    min(duration if allow_cross_boundary else core_end, end),
+                )
                 if end <= start:
                     raise ValueError("A subtitle cue has no duration")
                 checked.append({**cue, "start": start, "end": end})

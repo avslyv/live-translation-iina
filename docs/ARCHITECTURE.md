@@ -1,75 +1,98 @@
 # Architecture
 
-The IINA integration reads audio directly from a local video file and prepares a persistent Russian subtitle track. The original system-audio overlay remains a separate entry point.
+The IINA path prepares persistent native subtitles from a local video's text subtitle source or selected internal audio stream. English → Russian is the default. The sidebar offers 11 source/target languages: English, Russian, Spanish, German, French, Italian, Portuguese, Japanese, Korean, Chinese, and Ukrainian. The system-audio overlay remains a separate entry point.
 
-![The local file-to-subtitle pipeline and seek-aware queue](architecture.svg)
+![Local text/audio sources, fixed context, persistent cache, and native IINA tracks](architecture.svg)
 
 ## Components
 
 | Component | Responsibility |
 | --- | --- |
-| `iina-plugin/main.js` | Observes file, playback and seek events; polls the worker; loads or refreshes a native subtitle track. |
-| `iina_bridge.py` | Decodes audio, schedules missing sections, runs local inference and writes subtitle caches. |
-| `live_translation/deterministic.py` | Fixes inference settings and records exact model and engine identities. |
-| `live_translation/media_cache.py` | Identifies video content, validates cached cues and detects file changes. |
-| `live_translation/text_pipeline.py`, `translators.py`, `sessions.py` | Reuses upstream text cleanup, translation prompts, Ollama transport and subtitle export. |
+| `iina-plugin/main.js` | Observes playback/source changes, sends heartbeats, owns automatic pauses, and manages native primary/secondary subtitles. |
+| `iina-plugin/sidebar.*` | Russian settings, installed-model list, coverage, errors, glossary, and saved versions. The WebView has no direct network access. |
+| `iina_bridge.py` | Local HTTP boundary, one model worker, decoding, scheduling, memory handoff, and subtitle export. |
+| `live_translation/iina_features.py` | Source/profile selection, asynchronous initialization, persistent settings, cache versions, and incremental publication. |
+| `live_translation/subtitle_sources.py` | Resolves selected text/internal audio, parses SRT/ASS/SSA, extracts supported embedded text, and records source identity. |
+| `live_translation/translation_quality.py` | Canonical glossary, stable cue IDs, bounded source context, structured batches, validation, and missing-cue retries. |
+| `live_translation/speech_vad.py`, `assets/` | Optional pinned local Silero detector, model digest, and MIT license. |
+| `live_translation/deterministic.py`, `media_cache.py` | Fixed inference settings, model/engine identities, content hashes, and cache validation. |
+| `service_contract.py`, `service_control.py`, `runtime_lifecycle.py` | Loaded-runtime identity, verified startup, update transactions, and worker restart. |
 
-## Preparing a video
+## Sources and asynchronous initialization
 
-1. FFmpeg decodes the first audio track to mono, 16 kHz audio.
-2. Work is divided into fixed 30-second sections with one second of decoding context. Word midpoints assign overlapping recognition output to one section, avoiding duplicate boundary words.
-3. Whisper runs through MLX on the Mac's GPU. Recognized words become timed phrases using duration, length and pause boundaries.
-4. Gemma runs through the local Ollama server and translates each phrase. Its context contains only earlier phrases from the same fixed section, in timestamp order.
-5. Each completed section is saved to JSON. Russian cues are exported to a normal SRT file, which the plugin loads with mpv's `sub-add` or refreshes with `sub-reload`.
+The plugin supplies the local path, selected audio/subtitle track metadata, source mode, and audio/subtitle delays. **Auto** prefers suitable text subtitles, excluding generated Live Translation and forced/signs-only tracks. Supported external formats are SRT, ASS, and SSA; supported embedded text includes SubRip/ASS/SSA and MOV/MP4 `mov_text`. Image subtitles are not OCR input. If auto mode finds no suitable text, it uses the selected internal audio. Explicit text mode reports unusable input instead of silently changing its source.
 
-The worker prepares missing sections at the current position first, then the next 180 seconds, then the remaining gaps in the file. Preparation continues while playback is paused. Once at least 60 seconds are buffered, future work can use batches of up to four sections: recognize the batch, release Whisper, then translate it. The two models use memory in separate phases.
+Audio mapping uses the selected FFmpeg stream index or audio ordinal. Older clients without metadata retain a first-audio fallback. External audio, remote media, and DVD navigation are outside this adapter's scope.
 
-## Seeking and playback
+Production HTTP requests queue initialization. The model worker hashes/probes the media, extracts text, and inspects model/profile data outside the HTTP condition lock. A large hash does not block settings or seeks. Each request carries frozen settings and a generation; an obsolete initialization cannot become active or replace the current cache-index entry.
 
-A seek changes the work generation and makes the new position urgent. The worker checks the active file, generation and heartbeat before committing output; superseded work cannot write stale translations. Cancellation takes effect at these checks rather than interrupting an inference kernel in progress.
+## Recognition, context, and time
 
-If the selected section is missing, the plugin shows a preparation message and pauses playback. It resumes only a pause that it owns, after the matching section is ready and its SRT is applied. A pause made by the viewer stays paused. Manually resuming, hiding subtitles or choosing another track cancels that wait. Errors and a 45-second timeout also release a plugin-owned pause.
+FFmpeg decodes mono float32 audio at 16 kHz into fixed 30-second sections with one second of recognition context. Word midpoints assign overlapping recognition output to one section. The full multilingual Whisper Turbo model receives the selected source language. A running call retains its media's language even if global settings change.
 
-Completed sections load from disk without inference. A completed silent section is also cached, with an empty cue list. Until the full file has been prepared, a seek to a missing section can still require recognition and translation.
+Experimental **conservative** VAD is off by default. When enabled, Silero 6.2.1 runs locally through PyTorch using the bundled SHA-256-pinned MIT model. It can skip an entire source window with no speech candidate. It never crops, concatenates, or time-compresses audio: retained samples reach Whisper intact. Padding is used only inside the detector. Quiet speech can be missed, and VAD does not guarantee rejection of music/noise or all false captions.
 
-## Cache identity and reproducibility
+Translation uses neighboring **source** cues in fixed timeline order, including section boundaries. Text mode uses the parsed source timeline; audio mode obtains neighboring fixed recognition sections. Default context takes up to two cues on either side, bounded to 12 cues and 2400 source characters. It contains no translated conversation or seek-order-dependent history. Matching canonical glossary terms accompany the request.
 
-The subtitle cache key combines the SHA-256 of the video's bytes with the generation profile. File paths are not part of that identity, so unchanged copies and renamed files reuse the same translation. A cheap file-stat signature memoizes hashing within the worker and helps detect source changes.
+Ollama receives one or four requested cues according to settings and a JSON schema. Short IDs are assigned once per batch and restored to stable internal cue IDs after validation; context omits unused opaque IDs. IDs and strings are validated before publication. Missing or invalid strings are retried without recomputing validated siblings; unknown/duplicate IDs are rejected. The wire-ID map, context, glossary, and decoding options remain fixed across a retry.
 
-The profile includes model artifact identities, engine versions, inference settings, the prompt template and segmentation settings. Whisper uses greedy decoding with temperature zero; translation fixes seed `42`, temperature `0`, `top_k=1`, `top_p=1`, and disables thinking and speculative decoding. History starts afresh for every fixed section, making the prompt independent of seek order.
+Validated cues can appear incrementally in SRT while their section is translating. Only complete sections enter durable JSON `chunks`; uncommitted partial output is a display artifact. A long translated page may extend beyond its 30-second section. Its `owner_start` ties it to the original source cue's section so reload validation preserves it.
 
-Reusing a completed cache guarantees the same saved text. Fresh computation is not promised to be bit-identical across different hardware, kernels or engine versions. Changing the profile selects a different cache without deleting older results.
+Source and display times are separate. Text keeps raw timestamps; subtitle delay determines display/section ownership and is applied once by IINA. Audio preparation accounts for audio and subtitle delays when mapping recognition to playback. SRT export removes the already-accounted subtitle offset before the player reapplies its global delay. Track or delay changes select another source identity.
 
-By default, files live under `~/Library/Application Support/LiveTranslate/subtitles/`:
+## Queue and native playback
+
+The queue prepares the current missing section, the next 180 seconds, then remaining gaps. Work continues during a normal pause. Once at least 60 seconds are buffered, phase-based recognition can handle up to four future sections per Whisper load, then release it and translate. This ASR phase batch is separate from the sidebar's one/four-cue LLM request size.
+
+A seek supersedes older work. File/source signatures, generation, model artifacts, and engine provenance are checked before commits. A model replaced during an in-flight request cannot write new output under the old profile. Cancellation takes effect at these checks rather than interrupting a running GPU kernel.
+
+With **wait for translation** enabled, a missing current section may trigger a plugin-owned pause. Only that pause is resumed after matching subtitles are applied. User pauses, manual subtitle selection, and hiding subtitles are respected. Errors and a 45-second timeout release the automatic pause. Disabling this option keeps playback running during preparation.
+
+The primary translation and optional secondary original are ordinary IINA tracks updated with mpv `sub-add`/`sub-reload`. Bilingual mode preserves a secondary track selected manually. Appearance, placement, visibility, and delay remain native player controls.
+
+**One service owns one active video.** Multiple windows do not have independent model queues or profiles. A newer active-file request can supersede another window's work.
+
+## Persistent versions and reproducibility
+
+Cache identity combines media-content SHA-256 with a generation profile. Source identity includes stream metadata, subtitle-content hash, language, and delays. The profile records exact model artifacts, engine versions (including FFmpeg for audio), prompt/context policy, glossary, VAD policy/model, inference options, and segmentation. Moving or renaming unchanged media reuses a matching version; changed source/generation settings select another version without deleting older output.
+
+Whisper uses greedy decoding at temperature zero. Translation fixes seed `42`, temperature `0`, `top_k=1`, and `top_p=1`, with thinking and speculative decoding disabled. Fixed prompts reduce variation; fresh computation is not promised bit-identical across hardware, kernels, or engine versions. Reusing a committed artifact guarantees the same saved text.
+
+The default private data layout under `~/Library/Application Support/LiveTranslate/` is:
 
 ```text
-<key>.json                         # Authoritative translated cues and profile
-<key>/Русский — Live Translation.srt # Native IINA subtitle track
-recognition/<asr-key>.json          # Recognition results, independent of translation
+iina-settings.json                     # Persisted settings and glossary
+subtitles/
+  index.json                           # Discoverable saved versions
+  <key>.json                           # Complete translated sections and provenance
+  <key>/<language> — Live Translation.srt
+  <key>/Original — Live Translation.srt
+  recognition/<asr-key>.json            # Recognition separate from translation
 ```
 
-Writes use temporary files followed by atomic replacement. Valid JSON can restore a missing or modified SRT without rerunning models. Recognition has its own identity, allowing unchanged speech work to survive a translation-profile change or an interrupted translation.
+Writes use atomic replacement. Existing output can reopen with Ollama stopped or its weights unavailable. Recognition has a separate identity, allowing compatible source work to survive translation-only changes. Partial output from an older engine is preserved while new work receives a new profile; old/new engine output is never mixed in one version. Display preferences do not require regenerating translation.
 
-## Local service protocol
+The cache panel discovers committed JSON even when an older install has no index. Compatible 1.3.2 output can be selected explicitly for its original first audio track as **read-only**. Its JSON and existing SRT remain unchanged, and missing sections are not filled using current models. New preparation creates a separate current-profile version. Deletion is scoped to one translation version and preserves other versions and shared recognition.
 
-The worker binds to `127.0.0.1:18743` by default. The plugin sends one state request at a time, normally once per second, with immediate requests after seeks and playback restarts.
+## Local protocol and updates
+
+The worker binds to `127.0.0.1:18743`; Ollama defaults to `127.0.0.1:11434`. Local calls bypass system HTTP proxies. The plugin normally has one state request in flight and polls about once per second, with immediate requests after playback/source events.
 
 | Endpoint | Access | Purpose |
 | --- | --- | --- |
-| `GET /health` | Unauthenticated | Basic service identity and protocol version. |
-| `POST /state` | Bearer token | Select a local file, update position/pause/seek state, or stop processing. Accepts JSON or form data; IINA uses form data. |
-| `GET /status` | Bearer token | Diagnostic state, including current file, progress, playback state and plugin diagnostics. |
+| `GET /health` | Public | Service/version/protocol, loaded runtime revision, process ID, and capabilities; no private playback state. |
+| `POST /state` | Bearer token | File, position, pause, tracks/delays, client/seek generation, selected saved version, or stop. |
+| `POST /control` | Bearer token | `describe`, persisted `settings`, `retry`, `cache_use`, and scoped `cache_delete`. |
+| `GET /status` | Bearer token | Diagnostic source/playback state, readiness, progress, generations, and client information. |
 
-`POST /state` supplies `path`, `position`, `paused` and `enabled`. The plugin also supplies `seek_generation`, `native_russian_selected` and `waiting_for_translation`. Responses include readiness, SRT path/revision, preparation progress and errors. The service limits request bodies to 16 KiB and rejects unrelated browser origins. A delayed stop for an old file does not stop a newly selected file.
+POST accepts JSON or form data; nested control data is JSON inside the form. The body limit is **256 KiB**. Unrelated browser origins are rejected. Responses carry loaded-runtime identity and `Cache-Control: no-store`. A delayed stop for an old file does not stop a newly selected file.
 
-Heartbeats expire after 12 seconds without IINA updates. The worker then stops preparing new sections and releases models; after completing a file it unloads models after ten idle seconds. The lightweight service remains available through a per-user LaunchAgent.
+Heartbeats expire after 12 seconds. The worker stops scheduling and releases models; completed preparation also unloads them after ten idle seconds. The lightweight LaunchAgent remains available. Installation brackets runtime changes with `updating`/`ready` markers, then verifies a matching new process. The launcher reuses compatible code or performs one bounded verified restart. A source watcher exits after completed updates so launchd reloads the worker. Environments, tokens, model weights, and caches survive updates.
 
-## Privacy and boundaries
+## Privacy and release limits
 
-Recognition uses installed local Whisper weights; playback does not download models. Translation talks to Ollama on `127.0.0.1:11434`. Initial dependency and model installation requires network access.
+No microphone, BlackHole, or output routing is required. Initial installation downloads components/models; playback uses installed local weights and loopback services. The sidebar sends actions through the plugin. A scoped token is embedded only in the installed copy, outside the checkout. IINA 1.5+ requires filesystem permission for native subtitle-file commands; direct JavaScript filesystem calls are removed from the configured copy.
 
-The installer creates a scoped service token and embeds it only in the installed plugin, outside the source checkout. The installed plugin needs loopback networking and IINA OSD permissions. IINA 1.5+ also guards native subtitle-file commands with its filesystem permission, so the installer retains that permission for those versions. Direct JavaScript filesystem calls are removed from the installed plugin. Audio is decoded from the file, without microphone capture or audio-device routing.
+Saved data contains paths, transcript/translation text, timings, and settings/glossary. Review caches and diagnostics before sharing them publicly.
 
-Caches contain transcript text, translations, timing and the source file path. They stay on the Mac and should be treated as private media-derived data. Diagnostic responses can also contain local paths; do not attach them to public issues without reviewing them.
-
-The current IINA path supports one local video at a time, English speech to Russian text, and the first audio track. Network streams, DVD navigation and live changes to the selected audio track are outside this adapter's current scope.
+Developer ID/notarization automation is available, but a real notarized build requires authorized signing material. A fresh macOS VM acceptance run remains separate from the host-isolated cold-install test. Neither is claimed completed by adding automation. See [release signing and test limits](RELEASE_SIGNING.md).

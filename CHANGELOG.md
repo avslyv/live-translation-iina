@@ -1,5 +1,36 @@
 # Changelog
 
+## 1.4.0 — 2026-11-17
+
+- Reuse a private local signing certificate for installer/DMG and the installed
+  IINA launcher, preserving their identity across local rebuilds without changing
+  trust settings. Keep ad-hoc CI and Developer ID/notarization as explicit modes.
+
+### Sources, native sidebar and durable versions
+
+- Prefer a full source-language text subtitle track, including external SRT/ASS/SSA
+  and supported embedded text. Use speech recognition when no suitable text exists.
+- Decode the audio track selected in IINA and fingerprint source content, stream,
+  language and timing offsets. Clear stale native tracks when the input changes.
+- Add a Russian IINA sidebar with source/model/language settings, timeline coverage,
+  playback-wait control, glossary, model discovery and saved-translation management.
+- Use fixed neighboring source context across chunk boundaries, validated local
+  translation batches and incremental native SRT publication. Recheck model
+  identities before committing work and preserve older model versions separately.
+- Move file hashing and source initialization off the HTTP request path.
+- Read completed translations with Ollama stopped or weights unavailable. Discover
+  pre-1.4 caches as immutable saved versions, without mixing new inference into them.
+- Add optional original-language secondary subtitles and eleven explicit language
+  choices. Preserve manual primary/secondary selections and pauses.
+- Ship a pinned MIT-licensed Silero VAD model for experimental whole-window speech
+  gating. Retained audio is never cropped or concatenated; filtering is off by default.
+- Add a standalone token-free IINA package, artifact verification report and
+  optional Developer ID/notarization CI support. This release uses the persistent
+  local certificate; Apple notarization and fresh-OS testing were not performed.
+  See [release signing](docs/RELEASE_SIGNING.md).
+
+Validation and measured results are tracked in [the benchmark guide](docs/BENCHMARK_1_4.md).
+
 ## 1.3.2 — 2026-11-17
 
 ### Automatic update recovery

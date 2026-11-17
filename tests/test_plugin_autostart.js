@@ -16,7 +16,8 @@ function compatibleHealth(runtime = 'test-runtime-1', processId = 32100) {
 function playerHarness(options = {}) {
   const properties = {
     path: '/tmp/first-video.avi', duration: 600, 'time-pos': 0,
-    pause: false, sid: 'no', 'sub-visibility': false, ...options.properties,
+    pause: false, sid: 'no', aid: 'no', 'secondary-sid': 'no',
+    'secondary-sub-visibility': true, 'sub-visibility': false, ...options.properties,
   };
   const listeners = new Map();
   const intervals = [];
@@ -26,11 +27,15 @@ function playerHarness(options = {}) {
   const writes = [];
   const requests = [];
   const healthRequests = [];
+  const controlRequests = [];
+  const sidebarMessages = [];
+  const sidebarListeners = new Map();
+  const sidebarFiles = [];
   const preferences = new Map();
-  const subtitles = [];
+  const subtitles = [...(options.tracks || [])];
   const osd = [];
   const roots = [];
-  let nextId = 1;
+  let nextId = Math.max(0, ...subtitles.map(track => Number(track.id) || 0)) + 1;
   let now = 1000;
   let runtime = 'test-runtime-1';
   let processId = 32100;
@@ -53,7 +58,7 @@ function playerHarness(options = {}) {
   const context = vm.createContext({
     iina: {
       console: { log() {} },
-      core: { osd(message) { osd.push(message); } },
+      core: { window: { loaded: Boolean(options.sidebar) }, osd(message) { osd.push(message); } },
       event: { on(name, action) { listeners.set(name, action); } },
       file: { exists() { return true; }, read() { return 'test-scoped-local-token'; } },
       preferences: {
@@ -61,11 +66,24 @@ function playerHarness(options = {}) {
         set(name, value) { preferences.set(name, value); }, sync() {},
       },
       menu: { item, separator() { return {}; }, addItem(root) { roots.push(root); } },
+      sidebar: options.sidebar ? {
+        loadFile(file) { sidebarFiles.push(file); sidebarListeners.clear(); },
+        onMessage(name, callback) { sidebarListeners.set(name, callback); },
+        postMessage(name, data) { sidebarMessages.push({ name, data }); },
+        show() {},
+      } : undefined,
       http: { get(url) {
         healthRequests.push(url);
         return Promise.resolve(healthFor()).then(data => ({ data }));
       }, post(url, requestOptions) {
         const request = { url, ...requestOptions.data };
+        if (url.endsWith('/control')) {
+          controlRequests.push(request);
+          const data = options.control ? options.control(request) : {
+            settings: {}, models: [], cache: [], languages: { ru: 'Русский', en: 'Английский' },
+          };
+          return Promise.resolve(data).then(data => ({ data }));
+        }
         requests.push(request);
         const stamp = { protocol: 1, runtime_id: runtime, process_id: processId };
         return Promise.resolve(responseFor(request)).then(data => ({
@@ -81,7 +99,7 @@ function playerHarness(options = {}) {
         command(name, args) {
           commands.push([name, Array.from(args)]);
           if (name === 'sub-add') {
-            const track = { type: 'sub', id: nextId++, 'external-filename': args[0] };
+            const track = { type: 'sub', id: nextId++, 'external-filename': args[0], title: args[2], lang: args[3] };
             subtitles.push(track);
             if (args[1] === 'select') write('sid', String(track.id));
           } else if (name === 'sub-reload') {
@@ -120,7 +138,8 @@ function playerHarness(options = {}) {
     throw new Error('Plugin did not settle');
   }
   return {
-    properties, subtitles, commands, writes, requests, healthRequests, osd, roots, context,
+    properties, subtitles, commands, writes, requests, healthRequests, controlRequests,
+    sidebarMessages, sidebarListeners, sidebarFiles, osd, roots, context,
     setResponse(fn) { responseFor = fn; },
     setHealth(fn) { healthFor = fn; },
     setRuntime(value) { runtime = value; },
@@ -660,3 +679,221 @@ for (const method of ['health', 'state']) {
     assert.equal(h.properties['sub-visibility'], true);
   });
 }
+
+test('source selection keeps the original subtitle after native Russian auto-selection', async () => {
+  const h = playerHarness({ nativeEvents: true, properties: { sid: '7', aid: '2' }, tracks: [
+    { type: 'audio', id: 2, selected: true, 'ff-index': 1, lang: 'eng' },
+    { type: 'sub', id: 7, selected: true, 'ff-index': 3, codec: 'subrip', lang: 'eng' },
+  ] });
+  await h.settle();
+  await h.tick();
+  for (const request of h.requests.filter(request => request.enabled === 'true')) {
+    const selected = JSON.parse(request.selection);
+    assert.equal(selected.subtitle_track_id, 7);
+    assert.equal(selected.audio_track_id, 2);
+    assert.equal(selected.mode, 'auto');
+    assert.ok(!selected.tracks.some(track => String(track.title || '').includes('Live Translation')));
+    assert.ok(request.client_id && request.session_id);
+  }
+});
+
+test('audio changes immediately remove stale Russian subtitles and ignore the old in-flight response', async () => {
+  const h = playerHarness({ nativeEvents: true, properties: { pause: true, aid: '1' }, tracks: [
+    { type: 'audio', id: 1, 'ff-index': 1 }, { type: 'audio', id: 2, 'ff-index': 2 },
+  ] });
+  await h.settle();
+  const old = deferred();
+  h.setResponse(() => old.promise);
+  await h.tick();
+  const before = h.requests.at(-1).session_id;
+  h.setResponse(() => ({ ...ready(), path: '/tmp/new-audio-ru.srt' }));
+  h.userSet('aid', '2');
+  assert.ok(!h.subtitles.some(track => track['external-filename'] === '/tmp/first-ru.srt'));
+  await h.settle();
+  assert.equal(JSON.parse(h.requests.at(-1).selection).audio_track_id, 2);
+  assert.notEqual(h.requests.at(-1).session_id, before);
+  old.resolve({ ...ready(99), path: '/tmp/stale-audio-ru.srt' });
+  await h.settle();
+  assert.ok(!h.commands.some(([name, args]) => name === 'sub-add' && args[0] === '/tmp/stale-audio-ru.srt'));
+  assert.equal(h.properties.pause, true);
+});
+
+test('subtitle timing changes invalidate the source without changing a manual pause', async () => {
+  const h = playerHarness({ nativeEvents: true, properties: { pause: true } });
+  await h.settle();
+  h.setResponse(() => ({ ...missing(), path: null, initializing: true }));
+  h.userSet('sub-delay', 1.25);
+  assert.ok(!h.subtitles.some(track => String(track.title || '').includes('Live Translation')));
+  await h.settle();
+  assert.equal(JSON.parse(h.requests.at(-1).selection).subtitle_delay, 1.25);
+  assert.equal(h.properties.pause, true);
+});
+
+test('an initializing source revision clears the previous native translation', async () => {
+  const h = playerHarness({ response: () => ({ ...ready(), source_revision: 1 }) });
+  await h.settle();
+  h.setResponse(() => ({ ...missing(), path: null, source_revision: 2, initializing: true }));
+  await h.tick();
+  assert.ok(!h.subtitles.some(track => track['external-filename'] === '/tmp/first-ru.srt'));
+});
+
+test('the playback-first setting never creates a translation-owned pause', async () => {
+  const h = playerHarness({ response: () => ({ ...missing(), settings: { wait_for_translation: false } }) });
+  await h.settle();
+  assert.equal(h.properties.pause, false);
+  assert.ok(!h.writes.some(([name, value]) => name === 'pause' && value === true));
+});
+
+test('a missing section in a read-only saved version never owns a playback pause', async () => {
+  const h = playerHarness({ response: () => ({ ...missing(), read_only: true }) });
+  await h.settle();
+  assert.equal(h.properties.pause, false);
+  assert.ok(!h.writes.some(([name, value]) => name === 'pause' && value === true));
+  assert.match(h.osd.at(-1), /сохранённой версии нет перевода/);
+  const notices = h.osd.length;
+  await h.tick();
+  assert.equal(h.osd.length, notices);
+});
+
+test('a read-only missing section releases an earlier owned wait but preserves manual pause', async () => {
+  const h = playerHarness({ response: () => missing(), nativeEvents: true });
+  await h.settle();
+  assert.equal(h.properties.pause, true);
+  h.setResponse(() => ({ ...missing(), read_only: true }));
+  await h.tick();
+  assert.equal(h.properties.pause, false);
+  const paused = playerHarness({ properties: { pause: true }, response: () => ({ ...missing(), read_only: true }) });
+  await paused.settle();
+  assert.equal(paused.properties.pause, true);
+});
+
+test('bilingual mode attaches the original as a separate native secondary track', async () => {
+  const h = playerHarness({ nativeEvents: true, properties: { pause: true }, response: () => ({
+    ...ready(), original_path: '/tmp/first-en.srt', source_language: 'en', settings: { bilingual: true },
+  }) });
+  await h.settle();
+  const translated = h.subtitles.find(track => track['external-filename'] === '/tmp/first-ru.srt');
+  const original = h.subtitles.find(track => track['external-filename'] === '/tmp/first-en.srt');
+  assert.ok(translated && original);
+  assert.equal(h.properties.sid, String(translated.id));
+  assert.equal(h.properties['secondary-sid'], String(original.id));
+  assert.equal(h.properties.pause, true);
+  await h.tick();
+  assert.equal(JSON.parse(h.requests.at(-1).selection).tracks.filter(track => track.type === 'sub').length, 0);
+});
+
+test('bilingual mode preserves a manually selected secondary subtitle track', async () => {
+  const h = playerHarness({ properties: { 'secondary-sid': '47' }, tracks: [
+    { type: 'sub', id: 47, 'external-filename': '/tmp/manual-secondary.srt' },
+  ], response: () => ({ ...ready(), original_path: '/tmp/first-en.srt', settings: { bilingual: true } }) });
+  await h.settle();
+  assert.equal(h.properties['secondary-sid'], '47');
+  assert.ok(!h.commands.some(([name, args]) => name === 'sub-add' && args[0] === '/tmp/first-en.srt'));
+});
+
+test('bilingual reloads preserve an explicit secondary-hide choice', async () => {
+  const h = playerHarness({ nativeEvents: true, response: () => ({
+    ...ready(), original_path: '/tmp/first-en.srt', settings: { bilingual: true },
+  }) });
+  await h.settle();
+  h.userSet('secondary-sub-visibility', false);
+  h.setResponse(() => ({ ...ready(2), original_path: '/tmp/first-en.srt', settings: { bilingual: true } }));
+  await h.tick();
+  assert.equal(h.properties['secondary-sub-visibility'], false);
+});
+
+test('sidebar uses a ready handshake and safely carries template-like strings without exposing its token', async () => {
+  const hostile = 'Модель ` ${globalThis.compromised = true} \\ " <script>evil</script>';
+  const h = playerHarness({ sidebar: true, control: () => ({
+    settings: { translation_model: hostile }, models: [{ name: hostile }], cache: [], languages: {},
+  }) });
+  await h.settle();
+  assert.deepEqual(h.sidebarFiles, ['sidebar.html']);
+  assert.equal(h.sidebarMessages.length, 0);
+  h.sidebarListeners.get('lt:ready')({});
+  await h.settle();
+  const envelope = h.sidebarMessages.at(-1).data;
+  const serialized = JSON.stringify(envelope);
+  assert.ok(!serialized.includes('`') && !serialized.includes('$'));
+  let received;
+  const host = { compromised: false, window: { iina: { _emit(name, json) { received = JSON.parse(json); } } } };
+  vm.runInNewContext('window.iina._emit(`lt:state`, String.raw`' + serialized + '`)', host);
+  assert.equal(host.compromised, false);
+  assert.equal(JSON.parse(received.json).settings.translation_model, hostile);
+  assert.ok(!JSON.stringify(h.sidebarMessages).includes('test-scoped-local-token'));
+});
+
+test('sidebar settings send only the supported fields and use authenticated local control routing', async () => {
+  const h = playerHarness({ sidebar: true });
+  await h.settle();
+  h.sidebarListeners.get('lt:ready')({});
+  await h.settle();
+  h.sidebarListeners.get('lt:action')({ action: 'settings', requestId: 'save-1',
+    data: { source_language: 'en', target_language: 'ru', source_mode: 'audio', unrecognized: 'discard' } });
+  await h.settle();
+  const request = h.controlRequests.find(request => request.action === 'settings');
+  assert.ok(request);
+  assert.equal(request.url, 'http://127.0.0.1:18743/control');
+  assert.deepEqual(JSON.parse(request.data), { source_language: 'en', target_language: 'ru', source_mode: 'audio' });
+  assert.ok(request.client_id && request.session_id);
+});
+
+test('choosing a cached version persists its key in state polling until the source changes', async () => {
+  const h = playerHarness({ sidebar: true });
+  await h.settle();
+  h.sidebarListeners.get('lt:action')({ action: 'cache_use', data: { key: 'saved-version' } });
+  await h.settle();
+  await h.tick();
+  assert.equal(h.requests.at(-1).cache_key, 'saved-version');
+  h.userSet('audio-delay', 0.2);
+  await h.settle();
+  assert.equal(h.requests.at(-1).cache_key, '');
+});
+
+test('display-only settings preserve a selected read-only cache and manual pause', async () => {
+  let saved = { source_language: 'en', target_language: 'ru', source_mode: 'auto', bilingual: false,
+    wait_for_translation: true, translation_model: 'gemma4:12b', vad_mode: 'off', batch_size: 4, glossary: [] };
+  const h = playerHarness({ sidebar: true, properties: { pause: true },
+    response: () => ({ ...ready(), read_only: true, settings: saved }),
+    control: request => {
+      if (request.action === 'settings') saved = { ...saved, ...JSON.parse(request.data) };
+      return { settings: saved, models: [], cache: [], languages: {} };
+    } });
+  await h.settle();
+  h.sidebarListeners.get('lt:action')({ action: 'cache_use', data: { key: 'legacy-version' } });
+  await h.settle();
+  const session = h.requests.at(-1).session_id;
+  h.sidebarListeners.get('lt:action')({ action: 'settings', data: { bilingual: true, wait_for_translation: false } });
+  await h.settle();
+  await h.tick();
+  assert.equal(h.requests.at(-1).cache_key, 'legacy-version');
+  assert.equal(h.requests.at(-1).session_id, session);
+  assert.equal(h.properties.pause, true);
+});
+
+test('automatic source metadata does not silently nominate English for a configured Spanish source', async () => {
+  const h = playerHarness({ tracks: [
+    { type: 'sub', id: 6, codec: 'subrip', lang: 'en' },
+    { type: 'sub', id: 7, codec: 'subrip', lang: 'es' },
+  ], response: () => ({ ...ready(), settings: { source_language: 'es', source_mode: 'auto' } }) });
+  await h.settle();
+  await h.tick();
+  const selection = JSON.parse(h.requests.at(-1).selection);
+  assert.equal(selection.subtitle_track_id, null, 'the backend ranks unselected automatic sources by configured language');
+  assert.deepEqual(selection.tracks.map(track => track.lang), ['en', 'es']);
+});
+
+test('the sidebar reports model unavailability and clears that message after a successful refresh', async () => {
+  let offline = true;
+  const h = playerHarness({ sidebar: true, control: () => ({ settings: {}, models: [], cache: [], languages: {},
+    ...(offline ? { model_error: 'Ollama недоступен. Сохранённые переводы можно открыть без него.' } : {}),
+  }) });
+  await h.settle();
+  h.sidebarListeners.get('lt:ready')({});
+  await h.settle();
+  assert.match(JSON.parse(h.sidebarMessages.at(-1).data.json).modelError, /Ollama недоступен/);
+  offline = false;
+  h.sidebarListeners.get('lt:action')({ action: 'describe', data: {} });
+  await h.settle();
+  assert.equal(JSON.parse(h.sidebarMessages.at(-1).data.json).modelError, '');
+});

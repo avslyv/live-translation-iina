@@ -792,7 +792,7 @@ class BridgeTests(unittest.TestCase):
             status, health = request("GET", "/health")
             self.assertEqual(status, 200)
             self.assertNotIn("path", health)
-            self.assertEqual(health["version"], "1.3.2")
+            self.assertEqual(health["version"], "1.4.0")
             self.assertEqual(len(health["runtime_id"]), 64)
             self.assertIn("state_form", health["capabilities"])
             self.assertIn("auto_restart", health["capabilities"])

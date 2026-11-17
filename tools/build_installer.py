@@ -2,8 +2,9 @@
 """Build a native Apple silicon installer app and downloadable release archives.
 
 The app contains source and a small native frontend. Its bootstrap downloads
-verified prerequisites and model weights at installation time. No local models,
-virtualenv, token, cache, signing credential, or source checkout is bundled.
+verified prerequisites and the large Whisper/Gemma weights at installation time.
+No private models, virtualenv, token, cache, signing credential, or source checkout
+is bundled. A pinned public Silero VAD asset and its MIT license are included.
 """
 
 from __future__ import annotations
@@ -20,20 +21,34 @@ import subprocess
 import sys
 import tempfile
 import tomllib
+import uuid
+import zipfile
 from pathlib import Path
 
 SOURCE = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(SOURCE))
+from tools.local_signing import sign_local  # noqa: E402
+
 APP_NAME = "Live Translation Installer.app"
 EXECUTABLE = "LiveTranslationInstaller"
 ARTIFACT = "Live-Translation-Installer-arm64"
+PLUGIN_ARTIFACT = "Live-Translation-IINA.iinaplgz"
+VERIFICATION_ARTIFACT = ARTIFACT + ".verification.json"
 REQUIRED_PAYLOAD = (
     "iina_bridge.py",
     "requirements-iina.txt",
     "requirements-iina.lock.txt",
     "LICENSE",
     "tools/install_iina.py",
+    "tools/local_signing.py",
     "iina-plugin/main.js",
     "iina-plugin/Info.json",
+    "iina-plugin/sidebar.html",
+    "iina-plugin/sidebar.css",
+    "iina-plugin/sidebar.js",
+    "live_translation/assets/silero_vad.jit",
+    "live_translation/assets/silero.json",
+    "live_translation/assets/SILERO_LICENSE",
     "installer/bootstrap.py",
     "installer/dependencies.py",
     "installer/dependencies.lock.json",
@@ -85,11 +100,61 @@ def copy_payload(source: Path, destination: Path) -> dict[str, str]:
     return hashes
 
 
-def sign_app(app: Path, identity: str) -> None:
-    arguments = ["/usr/bin/codesign", "--force", "--options", "runtime", "--sign", identity]
+def signing_arguments(
+    identity: str, keychain: Path | None = None, *, hardened: bool = True
+) -> list[str]:
+    if identity != "-" and not (
+        identity.startswith("Developer ID Application: ")
+        or re.fullmatch(r"[A-Fa-f0-9]{40}", identity)
+    ):
+        raise RuntimeError("Select a Developer ID Application identity or '-' for an ad-hoc build")
+    arguments = ["/usr/bin/codesign", "--force", "--sign", identity]
+    if hardened:
+        arguments.extend(("--options", "runtime"))
     arguments.append("--timestamp=none" if identity == "-" else "--timestamp")
+    if keychain is not None:
+        arguments.extend(("--keychain", str(keychain)))
+    return arguments
+
+
+def sign_app(app: Path, identity: str, keychain: Path | None = None) -> dict | None:
+    if identity == "local":
+        return sign_local(app)
+    arguments = signing_arguments(identity, keychain)
     run(*arguments, str(app))
     run("/usr/bin/codesign", "--verify", "--deep", "--strict", str(app))
+    if identity != "-":
+        details = run(
+            "/usr/bin/codesign",
+            "--display",
+            "--verbose=4",
+            str(app),
+            capture_output=True,
+            text=True,
+        )
+        observed = (details.stdout or "") + (details.stderr or "")
+        if (
+            "Authority=Developer ID Application:" not in observed
+            or not re.search(r"TeamIdentifier=[A-Z0-9]{10}(?:\n|$)", observed)
+            or not re.search(r"flags=0x[0-9a-fA-F]+\([^\n]*runtime", observed)
+            or not re.search(r"^Timestamp=(?!none\s*$).+", observed, re.MULTILINE)
+        ):
+            raise RuntimeError(
+                "The app lacks a timestamped Developer ID hardened-runtime signature"
+            )
+    return None
+
+
+def default_sign_identity(environ=None):
+    environ = os.environ if environ is None else environ
+    configured = environ.get("MACOS_SIGNING_IDENTITY")
+    if configured:
+        return configured
+    return "-" if environ.get("GITHUB_ACTIONS") == "true" else "local"
+
+
+def signing_label(identity):
+    return {"-": "ad-hoc", "local": "local-certificate"}.get(identity, "Developer ID Application")
 
 
 def zip_app(app: Path, destination: Path) -> None:
@@ -97,17 +162,158 @@ def zip_app(app: Path, destination: Path) -> None:
     run("/usr/bin/ditto", "-c", "-k", "--sequesterRsrc", "--keepParent", str(app), str(destination))
 
 
-def notarize(path: Path, profile: str) -> None:
-    run(
-        "/usr/bin/xcrun", "notarytool", "submit", str(path), "--keychain-profile", profile, "--wait"
+def verify_app_archive(path: Path) -> None:
+    with zipfile.ZipFile(path) as archive:
+        names = archive.namelist()
+        required = {
+            APP_NAME + "/Contents/Info.plist",
+            APP_NAME + "/Contents/MacOS/" + EXECUTABLE,
+            APP_NAME + "/Contents/Resources/installer-build.json",
+        }
+        if (
+            archive.testzip() is not None
+            or not required.issubset(names)
+            or any(Path(name).is_absolute() or ".." in Path(name).parts for name in names)
+        ):
+            raise RuntimeError("The installer ZIP failed its content/integrity check")
+
+
+def notarize(path: Path, profile: str, keychain: Path | None = None) -> dict:
+    """A successful CLI exit alone is not proof that Apple accepted an upload."""
+    authentication = ["--keychain-profile", profile]
+    if keychain is not None:
+        authentication.extend(("--keychain", str(keychain)))
+    failure = None
+    try:
+        result = run(
+            "/usr/bin/xcrun",
+            "notarytool",
+            "submit",
+            str(path),
+            *authentication,
+            "--wait",
+            "--timeout",
+            "30m",
+            "--output-format",
+            "json",
+            capture_output=True,
+            text=True,
+            timeout=1900,
+        )
+        output = result.stdout
+    except subprocess.CalledProcessError as error:
+        output, failure = error.stdout, error
+    try:
+        body = json.loads(output or "")
+        if not isinstance(body, dict):
+            raise ValueError("Expected a notarization object")
+        submission_id = str(uuid.UUID(body.get("id", "")))
+        status = body.get("status")
+    except (ValueError, TypeError, AttributeError) as error:
+        raise RuntimeError("Apple notarization did not return a valid submission status") from (
+            failure or error
+        )
+    log = run(
+        "/usr/bin/xcrun",
+        "notarytool",
+        "log",
+        submission_id,
+        *authentication,
+        capture_output=True,
+        text=True,
+        timeout=60,
     )
+    try:
+        log_body = json.loads(log.stdout)
+        issues = log_body.get("issues") or []
+        if not isinstance(log_body, dict) or not isinstance(issues, list):
+            raise ValueError("Invalid notary log")
+    except (ValueError, TypeError, AttributeError) as error:
+        raise RuntimeError("Apple notarization log could not be validated") from error
+    if failure is not None or status != "Accepted":
+        raise RuntimeError(
+            f"Apple did not accept {path.name}: {status!r}; submission {submission_id}. "
+            "Inspect its notarytool log before retrying."
+        ) from failure
+    if log_body.get("jobId") != submission_id or log_body.get("status") != "Accepted":
+        raise RuntimeError("Apple's notary log does not match the accepted submission")
+    if any(not isinstance(issue, dict) or issue.get("severity") == "error" for issue in issues):
+        raise RuntimeError(
+            "Apple's accepted submission still reports an error; review its notary log"
+        )
+    return {
+        "submission_id": submission_id,
+        "status": status,
+        "warnings": sum(issue.get("severity") == "warning" for issue in issues),
+        "log_sha256": hashlib.sha256(log.stdout.encode()).hexdigest(),
+    }
+
+
+def verify_notarized_app(app: Path) -> None:
+    run("/usr/bin/xcrun", "stapler", "validate", str(app))
+    run("/usr/bin/codesign", "--verify", "--deep", "--strict", str(app))
+    run("/usr/sbin/spctl", "--assess", "--type", "execute", "--verbose=4", str(app))
+    if Path("/usr/bin/syspolicy_check").is_file():
+        run("/usr/bin/syspolicy_check", "distribution", str(app))
+
+
+def pack_plugin(source: Path, destination: Path) -> None:
+    """IINA's official .iinaplgz format is ZIP with plugin files at its root."""
+    source = source.resolve()
+    # Reuse the installer allowlist and its installed-token/symlink guards.
+    payload_files(source)
+    info_path = source / "iina-plugin/Info.json"
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    if not isinstance(info, dict) or info.get("entry") != "main.js":
+        raise RuntimeError("The standalone plugin entry must be main.js")
+    files = {
+        "Info.json": info_path,
+        "main.js": source / "iina-plugin/main.js",
+        "LICENSE": source / "LICENSE",
+        **{
+            name: source / "iina-plugin" / name
+            for name in ("sidebar.html", "sidebar.css", "sidebar.js")
+        },
+    }
+    # Optional package-relative UI resources must be declared in Info.json.
+    for field in ("preferencesPage", "helpPage"):
+        if relative := info.get(field):
+            if (
+                not isinstance(relative, str)
+                or Path(relative).is_absolute()
+                or ".." in Path(relative).parts
+            ):
+                raise RuntimeError("The plugin contains an unsafe UI resource path")
+            resource = source / "iina-plugin" / relative
+            if not resource.is_file() or not resource.resolve().is_relative_to(
+                source / "iina-plugin"
+            ):
+                raise RuntimeError("The plugin UI resource is missing or escapes its package")
+            files[relative] = resource
+    with zipfile.ZipFile(destination, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+        for name, path in sorted(files.items()):
+            entry = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+            entry.create_system = 3
+            entry.external_attr = 0o100644 << 16
+            entry.compress_type = zipfile.ZIP_DEFLATED
+            archive.writestr(entry, path.read_bytes())
+    with zipfile.ZipFile(destination) as archive:
+        if archive.testzip() is not None or set(archive.namelist()) != set(files):
+            raise RuntimeError("The standalone IINA plugin archive failed verification")
 
 
 def build(args: argparse.Namespace) -> dict[str, Path]:
     if platform.system() != "Darwin" or platform.machine() != "arm64":
         raise RuntimeError("Build the installer on an Apple silicon Mac")
-    if args.notary_profile and args.sign_identity == "-":
+    if args.notary_profile and args.sign_identity in {"-", "local"}:
         raise RuntimeError("Notarization requires a Developer ID Application signing identity")
+    if args.sign_identity == "local":
+        if args.keychain is not None:
+            raise RuntimeError(
+                "Local signing uses its dedicated keychain; configure LT_SIGNING_DIR instead"
+            )
+    else:
+        signing_arguments(args.sign_identity, args.keychain)
     if not re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?", args.version):
         raise RuntimeError("Use a semantic release version such as 1.3.0")
     source = SOURCE.resolve()
@@ -153,7 +359,7 @@ def build(args: argparse.Namespace) -> dict[str, Path]:
             "version": args.version,
             "architecture": "arm64",
             "minimum_macos": "14.0",
-            "signing": "ad-hoc" if args.sign_identity == "-" else "Developer ID",
+            "signing": signing_label(args.sign_identity),
             "notarization_requested": bool(args.notary_profile),
             "payload_sha256": hashes,
         }
@@ -182,15 +388,31 @@ def build(args: argparse.Namespace) -> dict[str, Path]:
             "-o",
             str(binary),
         )
-        sign_app(app, args.sign_identity)
+        local_signature = sign_app(app, args.sign_identity, args.keychain)
         run(str(binary), "--self-test")
         run("/usr/bin/codesign", "--verify", "--deep", "--strict", str(app))
         archive = work / (ARTIFACT + ".zip")
         zip_app(app, archive)
+        verification = {
+            "schema": 1,
+            "version": args.version,
+            "signing": signing_label(args.sign_identity),
+            "notarized": False,
+            "gatekeeper_assessed": False,
+            "notarization": {},
+        }
+        if args.sign_identity == "local":
+            if local_signature is None:
+                raise RuntimeError("Local signing did not return its certificate identity")
+            verification["local_signature"] = local_signature
         if args.notary_profile:
-            notarize(archive, args.notary_profile)
+            verification["notarization"]["app"] = notarize(
+                archive, args.notary_profile, args.keychain
+            )
             run("/usr/bin/xcrun", "stapler", "staple", str(app))
+            verify_notarized_app(app)
             zip_app(app, archive)
+        verify_app_archive(archive)
         volume = work / "volume"
         volume.mkdir()
         shutil.copytree(app, volume / APP_NAME, symlinks=True)
@@ -219,29 +441,57 @@ def build(args: argparse.Namespace) -> dict[str, Path]:
             "-ov",
             str(image),
         )
+        if args.sign_identity == "local":
+            verification["local_disk_image_signature"] = sign_local(image, hardened=False)
         if args.notary_profile:
+            run(*signing_arguments(args.sign_identity, args.keychain, hardened=False), str(image))
+            verification["notarization"]["dmg"] = notarize(
+                image, args.notary_profile, args.keychain
+            )
+            run("/usr/bin/xcrun", "stapler", "staple", str(image))
+            run("/usr/bin/xcrun", "stapler", "validate", str(image))
             run(
-                "/usr/bin/codesign",
-                "--force",
-                "--sign",
-                args.sign_identity,
-                "--timestamp",
+                "/usr/sbin/spctl",
+                "--assess",
+                "--type",
+                "open",
+                "--context",
+                "context:primary-signature",
+                "--verbose=4",
                 str(image),
             )
-            notarize(image, args.notary_profile)
-            run("/usr/bin/xcrun", "stapler", "staple", str(image))
+            verification["notarized"] = True
+            verification["gatekeeper_assessed"] = True
+        run("/usr/bin/hdiutil", "verify", str(image))
+        plugin = work / PLUGIN_ARTIFACT
+        pack_plugin(source, plugin)
+        report = work / VERIFICATION_ARTIFACT
+        verification["artifacts"] = {
+            path.name: file_hash(path) for path in (image, archive, plugin)
+        }
+        report.write_text(
+            json.dumps(verification, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
         app_output = output / APP_NAME
         if app_output.exists():
             shutil.rmtree(app_output)
         shutil.copytree(app, app_output, symlinks=True)
         checksum = work / "SHA256SUMS"
         checksum.write_text(
-            "".join(f"{file_hash(path)}  {path.name}\n" for path in (image, archive)),
+            "".join(
+                f"{file_hash(path)}  {path.name}\n" for path in (image, archive, plugin, report)
+            ),
             encoding="utf-8",
         )
         # Only expose release archives after the complete signing/notarization
         # and archive verification path has succeeded.
-        artifacts = {"dmg": image, "zip": archive, "checksums": checksum}
+        artifacts = {
+            "dmg": image,
+            "zip": archive,
+            "plugin": plugin,
+            "verification": report,
+            "checksums": checksum,
+        }
         for kind, path in artifacts.items():
             destination = output / path.name
             shutil.copyfile(path, destination)
@@ -259,13 +509,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output-dir", type=Path, default=SOURCE / "dist")
     parser.add_argument(
         "--sign-identity",
-        default=os.environ.get("MACOS_SIGNING_IDENTITY", "-"),
-        help="codesign identity; '-' creates an ad-hoc signature",
+        default=default_sign_identity(),
+        help="'local' reuses a local certificate (default on your Mac); '-' is ad-hoc; or use a Developer ID identity",
     )
     parser.add_argument(
         "--notary-profile",
         default=os.environ.get("MACOS_NOTARY_PROFILE"),
         help="optional existing notarytool keychain profile; requires Developer ID",
+    )
+    parser.add_argument(
+        "--keychain",
+        type=Path,
+        default=os.environ.get("MACOS_SIGNING_KEYCHAIN"),
+        help="optional temporary keychain containing the signing identity and notary profile",
     )
     args = parser.parse_args(argv)
     try:

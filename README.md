@@ -7,7 +7,7 @@
 ![macOS 14+](https://img.shields.io/badge/macOS-14%2B-111827)
 ![Apple silicon](https://img.shields.io/badge/Apple_silicon-MLX-8b5cf6)
 
-Watch English videos in **IINA** with automatically generated **Russian subtitles**. Open a file, and the plugin prepares a translation, adds a normal subtitle track, and saves the result for your next viewing. Seeking, pausing, playback speed, subtitle styling, and full screen stay part of the player.
+Watch videos in **IINA** with local translated subtitles. English → Russian is the default. The plugin uses a full text subtitle track when available, otherwise transcribes the selected audio track. It adds a normal subtitle track and saves the result for your next viewing. Seeking, pausing, playback speed, subtitle styling, and full screen stay part of the player.
 
 The original **system audio mode** is included too: capture YouTube, Zoom, Twitch, livestreams, or another app and display the original and translation side by side in a floating glass overlay.
 
@@ -22,12 +22,14 @@ Inference runs locally on Apple silicon using **MLX Whisper + Ollama**. No API k
 ## TL;DR
 
 ```text
-IINA video ──► FFmpeg ──► Whisper / MLX ──► Gemma / Ollama
-                                                │
-             native IINA subtitles ◄── SRT ◄── JSON cache
+IINA ──► source text subtitles ──────────────► local LLM
+     └─► selected audio ──► Whisper / MLX ──►    │
+           native IINA subtitles ◄── SRT ◄── JSON cache
 ```
 
 - **Automatic:** opening a local video starts preparation and selects the Russian track.
+- **Subtitle first:** supported source-language text tracks bypass Whisper. Audio fallback follows IINA's selected track.
+- **Sidebar:** choose models, source and target languages, bilingual subtitles, glossary and saved versions inside IINA.
 - **Seek aware:** an uncached position becomes the next job. The player waits there and resumes when its subtitles are ready.
 - **Update recovery:** the service restarts after updates and IINA reconnects automatically, preserving your pause and subtitle choices.
 - **Persistent:** completed chunks survive restarts. Identical video content reuses the cache after a rename or move.
@@ -49,7 +51,7 @@ IINA video ──► FFmpeg ──► Whisper / MLX ──► Gemma / Ollama
 | --- | --- | --- |
 | Input | Local video files | Audio from apps on your Mac |
 | Output | Native IINA subtitle track | Floating bilingual glass overlay |
-| Languages | English → Russian | Configurable source and target |
+| Languages | Eleven choices; English → Russian by default | Configurable source and target |
 | Seeking | File timestamps, prioritized preparation | Follows live audio |
 | Cache | Content-addressed JSON + SRT | Separate session history |
 | Audio routing | Direct file decoding | BlackHole 2ch |
@@ -65,7 +67,7 @@ Requires an **Apple silicon Mac**, **macOS 14+**, and an internet connection for
 
 Open the disk image, then open **Live Translation Installer.app**. A [ZIP download](https://github.com/avslyv/live-translation-iina/releases/latest/download/Live-Translation-Installer-arm64.zip) is available too.
 
-This community build is ad-hoc signed and is not notarized by Apple. If macOS blocks the first launch, review the release and follow [Apple's instructions for opening an app you trust](https://support.apple.com/en-us/102445). That may require **System Settings → Privacy & Security → Open Anyway**. No Terminal command is required.
+The v1.4.0 installer is signed with the project's persistent local certificate and is not notarized by Apple. If macOS blocks the first launch, review the release and follow [Apple's instructions for opening an app you trust](https://support.apple.com/en-us/102445). That may require **System Settings → Privacy & Security → Open Anyway**. No Terminal command is required. The release includes a signing verification report and SHA-256 checksums.
 
 ### 2. Click Install Everything
 
@@ -78,6 +80,10 @@ The installer uses your user account's application and support folders. It does 
 ### 3. Open a video
 
 **Quit and reopen IINA**, then open a local English video. Translation starts automatically; no plugin menu action or subtitle selection is needed.
+
+Open the **Перевод** tab in IINA's sidebar, or choose **Plugin → Локальный перевод → Настройки и кэш…**. The panel shows the source, model, current-section readiness and prepared ranges. Settings include source mode, languages, installed translation models, a terminology glossary and optional original-language secondary subtitles. The **Кэш** tab lists saved versions and their storage usage; select a version to reuse it or remove a generated version you no longer need.
+
+Automatic source selection skips forced/signs-only tracks and this plugin's own generated output. External SRT/ASS/SSA and embedded SubRip/ASS/SSA/mov_text are supported. Unsupported or unsuitable text falls back to the selected internal audio stream. External audio files are not supported. Choose **Звук** explicitly when an existing subtitle track does not contain the full dialogue.
 
 When the current section has not been translated, the plugin shows **«Готовлю перевод этого участка…»**, pauses at the selected position, and resumes after loading the updated subtitle track. A pause you set yourself stays paused. You can resume manually to bypass that wait, hide subtitles, or select another track.
 
@@ -117,7 +123,7 @@ You can select other locally compatible models during installation:
   --translation-model gemma4:12b
 ```
 
-These flags change the model, not the IINA language pair. Model licenses apply separately; this repository does not distribute weights. Memory usage and preparation time depend on the model and hardware. The default pair was tested on an M4 Max with 36 GB of unified memory; no minimum-RAM performance claim is made for other Macs.
+These flags set the initial models; the sidebar controls the language pair and installed translation model. Whisper and translation weights are downloaded separately and their licenses apply. A small pinned Silero VAD model is bundled under its MIT license. Memory usage and preparation time depend on the model and hardware. The default pair was tested on an M4 Max with 36 GB of unified memory; no minimum-RAM performance claim is made for other Macs.
 
 The worker hands memory from Whisper to Ollama instead of intentionally keeping both models resident. When at least 60 seconds ahead are cached, future work uses batches of up to four chunks to reduce repeated model loads. The first missing chunk at the playhead is processed individually. Models are released after 10 seconds idle, and background work stops when IINA no longer sends heartbeats.
 
@@ -125,7 +131,9 @@ The worker hands memory from Whisper to Ollama instead of intentionally keeping 
 
 ### File timestamps, not captured playback
 
-IINA reports the file and playback position to an authenticated loopback service. FFmpeg decodes the file's first audio track into overlapping, fixed 30-second windows. Whisper words belong to a window by their timestamp midpoint, reducing boundary duplication. Words are grouped into phrases, translated with earlier context from the same window, and split into readable subtitle pages.
+IINA reports the file, selected source tracks, timing offsets and playback position to an authenticated loopback service. File hashing and source preparation run on the worker thread. Supported text tracks retain their cue timing and bypass Whisper; otherwise FFmpeg decodes the selected audio into overlapping, fixed 30-second windows. Whisper words belong to a window by timestamp midpoint. Native audio/subtitle delay controls are applied once.
+
+Translation receives fixed neighboring source cues, including across chunk boundaries, plus matching glossary entries. Context does not depend on viewing order. Requests contain bounded batches with stable cue IDs and validated JSON output; only missing results are retried, and validated results appear incrementally. The optional experimental Silero gate skips complete windows without a speech candidate, including tested silence and synthetic tones. It does not crop retained speech or promise perfect rejection of every kind of music. It is disabled by default.
 
 The scheduler prepares the playhead and the next 180 seconds first, then fills the remaining gaps. Explicit seeks cancel stale work. Recognition has its own cache, so a translation retry does not require recognizing the same speech again.
 
@@ -140,9 +148,11 @@ The cache key combines **video content SHA-256** and a **generation profile**: m
 └── recognition/<key>.json               # reusable English recognition
 ```
 
-Whisper uses a fixed seed and one temperature-zero greedy pass. Translation uses temperature zero, `top_k=1`, a fixed seed, and fixed per-chunk context. Seeking does not alter the prompt history for a chunk. Existing cached translations are never regenerated just because you rewind.
+Whisper uses a fixed seed and one temperature-zero greedy pass. Translation uses temperature zero, `top_k=1`, a fixed seed, fixed batch settings and neighboring source context. Seeking does not change that context. Existing cached translations are never regenerated just because you rewind.
 
 New computation is not guaranteed to be bit-identical across different GPUs, engines, or model versions. **Reusing the committed cache is what guarantees the same saved subtitle text.** A changed profile creates a separate cache. A missing or damaged SRT is rebuilt from JSON without running the models.
+
+Completed native caches can be reopened without a running Ollama server or installed weights. Partial caches keep their completed sections; preparing missing sections still requires their matching generation dependencies. Pre-1.4 caches appear as read-only saved versions for their original first-audio source. Their committed JSON is retained, and new inference is never appended to that older profile.
 
 ### Loopback only
 
@@ -199,7 +209,7 @@ curl --fail http://127.0.0.1:18743/health
 launchctl kickstart -k "gui/$(id -u)/local.live-translation.iina"
 ```
 
-Logs and backups are in `~/Library/Application Support/LiveTranslate/`. Use **Plugin → Локальные русские субтитры → Остановить перевод** to disable translation. This choice persists until you enable **Переводить автоматически** or **Включить и показать русский перевод** again.
+Logs and backups are in `~/Library/Application Support/LiveTranslate/`. Use **Plugin → Локальный перевод → Остановить перевод** to disable translation. This choice persists until you enable **Переводить автоматически** or **Включить и показать перевод** again.
 
 To stop the service:
 
@@ -224,12 +234,11 @@ Before attaching logs to an issue, remove tokens, private file paths, and transc
 
 ## Limitations
 
-- IINA mode currently supports local files, English → Russian, the first audio track, and one active video at a time.
-- Network URLs, live streams inside IINA, DVD navigation, and audio-track switching are not implemented in the file bridge.
+- IINA mode supports local files and one active video at a time. It translates supported text tracks or the selected internal audio track; external audio, network streams and DVD navigation are not supported. Language selection is explicit; English → Russian is the default.
 - Initial preparation and uncached seeks take time. A powerful Mac helps, but a new section cannot show a translation before it has been processed.
 - Speech recognition and LLM translation can make mistakes, especially with music, accents, jargon, and mixed languages.
 - IINA's plugin system is enabled by the installer; future IINA API changes may require updates.
-- The graphical installer is currently ad-hoc signed rather than Apple-notarized. It downloads prerequisites and models during setup; weights are not bundled in the release archive.
+- The v1.4.0 installer uses a persistent local certificate, without Apple notarization. It downloads prerequisites and the large Whisper/Gemma weights during setup. The small pinned Silero VAD model is bundled with its MIT license.
 
 ## Project structure
 

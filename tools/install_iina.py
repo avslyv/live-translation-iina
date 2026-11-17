@@ -30,6 +30,7 @@ from live_translation.runtime_lifecycle import (  # noqa: E402
     finish_runtime_update,
 )
 from live_translation.service_control import ensure_service, start_agent  # noqa: E402, F401
+from tools.local_signing import sign_local  # noqa: E402
 
 LABEL = "local.live-translation.iina"
 DEFAULT_WHISPER_MODEL = "mlx-community/whisper-large-v3-turbo"
@@ -92,7 +93,7 @@ def render_plugin(source: str, token: str) -> str:
         'const SERVICE_URL = "http://127.0.0.1:18743/state";': "const SERVICE_URL = "
         + json.dumps(config.bridge_url + "/state")
         + ";",
-        "const { console, core, event, file, http, menu, mpv, preferences }": "const { console, core, event, http, menu, mpv, preferences }",
+        "const { console, core, event, file, http, menu, mpv, preferences, sidebar }": "const { console, core, event, http, menu, mpv, preferences, sidebar }",
         'let token = "";': "let token = " + json.dumps(token) + ";",
         " || !file.exists(path)": "",
         "path && file.exists(path)": "path",
@@ -119,7 +120,14 @@ def copy_runtime(source: Path, destination: Path, *, require_worker: bool = True
     for name in ("requirements-iina.txt", "requirements-iina.lock.txt"):
         if (source / name).exists():
             files.append(source / name)
+    signing_helper = source / "tools/local_signing.py"
+    if signing_helper.is_file():
+        files.append(signing_helper)
     files.extend(sorted((source / "live_translation").glob("*.py")))
+    for name in ("silero_vad.jit", "silero.json", "SILERO_LICENSE"):
+        asset = source / "live_translation/assets" / name
+        if asset.is_file():
+            files.append(asset)
     for path in files:
         atomic_write(destination / path.relative_to(source), path.read_bytes(), 0o644)
 
@@ -197,8 +205,7 @@ def install_launcher(app: Path, iina: Path, agent: Path, plugin_info: dict, back
         shutil.copy2(icon, resources / "AppIcon.icns")
         info["CFBundleIconFile"] = "AppIcon"
     atomic_write(contents / "Info.plist", plistlib.dumps(info), 0o644)
-    run("/usr/bin/codesign", "--force", "--deep", "-s", "-", str(app))
-    run("/usr/bin/codesign", "--verify", "--deep", "--strict", str(app))
+    sign_local(app)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -382,6 +389,13 @@ def main(argv: list[str] | None = None) -> int:
         info = installed_plugin_metadata(info, tuple(int(part or 0) for part in match.groups()))
         code = render_plugin((SOURCE / "iina-plugin/main.js").read_text(), token)
         atomic_write(installed_plugin / "main.js", code.encode())
+        for asset in (SOURCE / "iina-plugin").iterdir():
+            if (
+                asset.is_file()
+                and asset.suffix in {".html", ".css", ".js"}
+                and asset.name != "main.js"
+            ):
+                atomic_write(installed_plugin / asset.name, asset.read_bytes())
         atomic_write(
             installed_plugin / "Info.json",
             (json.dumps(info, ensure_ascii=False, indent=2) + "\n").encode(),

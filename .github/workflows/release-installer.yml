@@ -8,9 +8,13 @@ on:
       tag:
         description: Existing release tag to build
         required: true
-        default: v1.3.2
+        default: v1.4.0
       publish:
         description: Attach installer files to the existing release
+        type: boolean
+        default: false
+      notarize:
+        description: Require Developer ID signing and Apple notarization (configured secrets required)
         type: boolean
         default: false
 
@@ -25,11 +29,12 @@ jobs:
   installer:
     name: Apple silicon installer
     runs-on: macos-15
-    timeout-minutes: 20
+    timeout-minutes: 80
     permissions:
       contents: write
     env:
       RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      NOTARIZE: ${{ (github.event_name == 'workflow_dispatch' && inputs.notarize) || (github.event_name == 'release' && vars.MACOS_NOTARIZE_RELEASES == 'true') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -38,6 +43,57 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.13"
+      - name: Prepare temporary Developer ID keychain
+        if: env.NOTARIZE == 'true'
+        env:
+          CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+          NOTARY_KEY_P8_BASE64: ${{ secrets.MACOS_NOTARY_KEY_P8_BASE64 }}
+          NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+        run: |
+          python - <<'PY'
+          import base64
+          import os
+          import secrets
+          import subprocess
+          from pathlib import Path
+
+          required = ("CERTIFICATE_P12_BASE64", "CERTIFICATE_PASSWORD", "SIGNING_IDENTITY", "NOTARY_KEY_P8_BASE64", "NOTARY_KEY_ID", "NOTARY_ISSUER_ID")
+          missing = [name for name in required if not os.environ.get(name)]
+          if missing:
+              raise SystemExit("Notarization requested but required signing secrets are missing: " + ", ".join(missing))
+          identity = os.environ["SIGNING_IDENTITY"]
+          if not identity.startswith("Developer ID Application: ") or any(char in identity for char in "\r\n"):
+              raise SystemExit("MACOS_SIGNING_IDENTITY must select a Developer ID Application certificate")
+          root = Path(os.environ["RUNNER_TEMP"]) / "live-translation-signing"
+          root.mkdir(mode=0o700)
+          certificate, key = root / "certificate.p12", root / "notary.p8"
+          for path, variable in ((certificate, "CERTIFICATE_P12_BASE64"), (key, "NOTARY_KEY_P8_BASE64")):
+              path.write_bytes(base64.b64decode(os.environ[variable], validate=True))
+              path.chmod(0o600)
+          keychain = root / "release.keychain-db"
+          password = secrets.token_urlsafe(40)
+
+          def command(*args):
+              result = subprocess.run(args, capture_output=True, text=True)
+              if result.returncode:
+                  raise SystemExit(Path(args[0]).name + " signing setup failed; credential values were not logged")
+
+          command("security", "create-keychain", "-p", password, str(keychain))
+          command("security", "set-keychain-settings", "-lut", "7200", str(keychain))
+          command("security", "unlock-keychain", "-p", password, str(keychain))
+          command("security", "import", str(certificate), "-k", str(keychain), "-P", os.environ["CERTIFICATE_PASSWORD"], "-T", "/usr/bin/codesign")
+          command("security", "set-key-partition-list", "-S", "apple-tool:,apple:,codesign:", "-s", "-k", password, str(keychain))
+          command("xcrun", "notarytool", "store-credentials", "live-translation-ci", "--key", str(key), "--key-id", os.environ["NOTARY_KEY_ID"], "--issuer", os.environ["NOTARY_ISSUER_ID"], "--keychain", str(keychain))
+          with Path(os.environ["GITHUB_ENV"]).open("a") as target:
+              target.write("MACOS_SIGNING_IDENTITY=" + identity + "\n")
+              target.write("MACOS_SIGNING_KEYCHAIN=" + str(keychain) + "\n")
+              target.write("MACOS_NOTARY_PROFILE=live-translation-ci\n")
+          certificate.unlink()
+          key.unlink()
+          PY
       - name: Build and verify the native installer
         run: |
           test "$(uname -m)" = arm64
@@ -53,6 +109,8 @@ jobs:
           path: |
             dist/Live-Translation-Installer-arm64.dmg
             dist/Live-Translation-Installer-arm64.zip
+            dist/Live-Translation-IINA.iinaplgz
+            dist/Live-Translation-Installer-arm64.verification.json
             dist/SHA256SUMS
           if-no-files-found: error
           retention-days: 14
@@ -69,16 +127,42 @@ jobs:
 
           tag = os.environ["RELEASE_TAG"]
           repo = os.environ["GITHUB_REPOSITORY"]
-          names = {"Live-Translation-Installer-arm64.dmg", "Live-Translation-Installer-arm64.zip", "SHA256SUMS"}
+          names = {"Live-Translation-Installer-arm64.dmg", "Live-Translation-Installer-arm64.zip", "Live-Translation-IINA.iinaplgz", "Live-Translation-Installer-arm64.verification.json", "SHA256SUMS"}
+          verification = json.loads(Path("dist/Live-Translation-Installer-arm64.verification.json").read_text())
+          if os.environ.get("NOTARIZE") == "true" and not verification.get("notarized"):
+              raise SystemExit("Refusing to publish an unnotarized build when notarization was requested")
           release = json.loads(subprocess.check_output([
               "gh", "release", "view", tag, "--repo", repo, "--json", "assets"
           ]))
           present = names & {asset["name"] for asset in release["assets"]}
           if present == names:
+              if os.environ.get("NOTARIZE") == "true":
+                  existing = json.loads(subprocess.check_output([
+                      "gh", "release", "download", tag, "--repo", repo,
+                      "--pattern", "Live-Translation-Installer-arm64.verification.json", "--output", "-"
+                  ]))
+                  if existing.get("notarized") is not True:
+                      raise SystemExit("The existing release is not notarized. Use a new release tag; published assets were left unchanged.")
               print("The release already contains the complete installer asset set; leaving it unchanged.")
           elif present:
               raise SystemExit("A partial installer asset set exists. Remove that set before republishing to keep checksums consistent.")
           else:
               files = [str(Path("dist") / name) for name in sorted(names)]
               subprocess.run(["gh", "release", "upload", tag, "--repo", repo, *files], check=True)
+          PY
+      - name: Remove temporary signing material
+        if: always() && env.NOTARIZE == 'true'
+        run: |
+          python - <<'PY'
+          import os
+          import shutil
+          import subprocess
+          from pathlib import Path
+
+          root = Path(os.environ["RUNNER_TEMP"]) / "live-translation-signing"
+          keychain = root / "release.keychain-db"
+          if keychain.exists():
+              subprocess.run(["security", "delete-keychain", str(keychain)], check=False, capture_output=True)
+          if root.exists():
+              shutil.rmtree(root)
           PY

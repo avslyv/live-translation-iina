@@ -273,6 +273,7 @@ class InstallerTests(unittest.TestCase):
                     clear=True,
                 ),
                 mock.patch.object(installer, "run"),
+                mock.patch.object(installer, "sign_local") as sign,
             ):
                 installer.install_launcher(
                     app,
@@ -281,6 +282,7 @@ class InstallerTests(unittest.TestCase):
                     {"identifier": "test.plugin", "version": "1.3.0"},
                     root / "Backup",
                 )
+            sign.assert_called_once_with(app)
             script = (app / "Contents/MacOS/LiveTranslationIINA").read_text()
             self.assertIn("export LT_INSTANCE_ID=local.live-translation.clean-test", script)
             self.assertIn("-m live_translation.service_control --ensure", script)

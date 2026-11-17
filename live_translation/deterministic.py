@@ -148,6 +148,16 @@ def local_model_identities(whisper_model, translation_model, *, hf_cache=None, o
             "Проверьте её кеш, конфигурацию и веса."
         ) from error
 
+    return {
+        "whisper_revision": whisper_identity,
+        "translation_digest": local_translation_identity(
+            translation_model, ollama_root=ollama_root
+        ),
+    }
+
+
+def local_translation_identity(translation_model, *, ollama_root=None):
+    """Identify installed translation weights without requiring Whisper or Ollama HTTP."""
     try:
         root = Path(
             ollama_root or os.environ.get("OLLAMA_MODELS", str(Path.home() / ".ollama/models"))
@@ -170,7 +180,7 @@ def local_model_identities(whisper_model, translation_model, *, hf_cache=None, o
             "Не удалось определить установленную модель перевода Ollama. "
             f"Проверьте локальную установку {translation_model}."
         ) from error
-    return {"whisper_revision": whisper_identity, "translation_digest": translation_digest}
+    return translation_digest
 
 
 def canonical_json(value):
@@ -184,10 +194,10 @@ def descriptor_hash(profile):
     return hashlib.sha256(canonical_json(profile).encode("utf-8")).hexdigest()
 
 
-def whisper_decode_options():
+def whisper_decode_options(language="en"):
     """Return a fresh dict: a single T=0 pass selects MLX's GreedyDecoder."""
     return {
-        "language": "en",
+        "language": None if language == "auto" else language,
         "task": "transcribe",
         "condition_on_previous_text": False,
         "word_timestamps": True,
@@ -248,6 +258,8 @@ def profile_descriptor(
     whisper_revision=None,
     translation_digest=None,
     engine_versions=None,
+    source_language="en",
+    target_language="ru",
 ):
     """Describe the inference contract and artifact identities for JSON caches.
 
@@ -258,17 +270,20 @@ def profile_descriptor(
     # A sentinel transcript and history pair include both prompt-template paths
     # without putting actual private transcript content into the fingerprint.
     prompt = live_translation_messages(
-        "en", "ru", "__NEW_TRANSCRIPT__", [("__EARLIER_SOURCE__", "__EARLIER_TRANSLATION__")]
+        source_language,
+        target_language,
+        "__NEW_TRANSCRIPT__",
+        [("__EARLIER_SOURCE__", "__EARLIER_TRANSLATION__")],
     )
     return {
         "profile_version": PROFILE_VERSION,
         "seed": SEED,
-        "source_language": "en",
-        "target_language": "ru",
+        "source_language": source_language,
+        "target_language": target_language,
         "whisper": {
             "model": str(whisper_model),
             "revision": whisper_revision,
-            "options": whisper_decode_options(),
+            "options": whisper_decode_options(source_language),
         },
         "translation": {
             "model": str(translation_model),

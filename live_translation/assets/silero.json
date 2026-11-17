@@ -1,0 +1,8 @@
+{
+  "version": "6.2.1",
+  "source": "https://pypi.org/project/silero-vad/6.2.1/",
+  "wheel_sha256": "09de93c4d874bb19c53e62a47dd38be5f163cedad2b5599583231f2a84ef79cb",
+  "model_sha256": "e1122837f4154c511485fe0b9c64455f7b929c96fbb8d79fbdb336383ebd3720",
+  "license": "MIT",
+  "file": "silero_vad.jit"
+}
